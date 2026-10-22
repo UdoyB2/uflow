@@ -480,10 +480,10 @@
   .reminder-composer label:first-child { grid-column: 1 / -1; }
   .auth-screen { display: block; }
   .auth-visual { display: none; }
-  .auth-panel { align-items: flex-start; min-height: 100vh; padding: 1.5rem; }
+  .auth-panel { align-items: stretch; flex-direction: column; justify-content: flex-start; min-height: 100vh; padding: 1.5rem; }
   .auth-panel { background: radial-gradient(circle at 100% 0, var(--blue-soft), transparent 18rem), var(--paper); }
   .auth-mobile-brand { display: block; margin-bottom: 4rem; }
-  .auth-card { max-width: 25rem; }
+  .auth-card { margin: 0 auto; max-width: 25rem; }
 }
 
 @media (max-width: 38rem) {
