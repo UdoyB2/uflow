@@ -479,10 +479,13 @@
   .reminder-composer { grid-template-columns: 1fr 1fr; }
   .reminder-composer label:first-child { grid-column: 1 / -1; }
   .auth-screen { display: block; }
-  .auth-visual { display: none; }
-  .auth-panel { align-items: stretch; flex-direction: column; justify-content: flex-start; min-height: 100vh; padding: 1.5rem; }
+  .auth-visual { border-radius: 1rem; margin: .75rem .75rem 0; min-height: 15rem; }
+  .auth-visual-copy { padding: 1.25rem; }
+  .auth-visual-copy p, .auth-visual-copy > small { display: none; }
+  .auth-visual-copy div[role='heading'] { font-size: 1.7rem; margin-top: .5rem; }
+  .auth-panel { align-items: stretch; flex-direction: column; justify-content: flex-start; padding: 1.5rem; }
   .auth-panel { background: radial-gradient(circle at 100% 0, var(--blue-soft), transparent 18rem), var(--paper); }
-  .auth-mobile-brand { display: block; margin-bottom: 4rem; }
+  .auth-mobile-brand { display: none; }
   .auth-card { margin: 0 auto; max-width: 25rem; }
 }
 
