@@ -195,3 +195,33 @@ export async function createGoogleEvent(event: NewEvent): Promise<string> {
 export async function deleteGoogleEvent(id: string): Promise<void> {
   await request(`${API}/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
+
+/**
+ * Creates a short Google Calendar event whose pop-up alert fires at its start time.
+ * The phone’s Google Calendar app then rings even when UFlow is closed.
+ */
+export async function createGoogleReminder(title: string, at: number): Promise<string> {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  const body = {
+    summary: `🔔 ${title}`,
+    description: 'Reminder from UFlow',
+    start: { dateTime: new Date(at).toISOString(), timeZone },
+    end: { dateTime: new Date(at + 15 * 60000).toISOString(), timeZone },
+    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] },
+  }
+  const data = (await request(API, { method: 'POST', body: JSON.stringify(body) })) as { id: string } | null
+  if (!data) throw new Error('Google Calendar didn’t accept the reminder.')
+  return data.id
+}
+
+/** Moves a reminder event (used by Snooze). */
+export async function moveGoogleReminder(id: string, at: number): Promise<void> {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  await request(`${API}/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      start: { dateTime: new Date(at).toISOString(), timeZone },
+      end: { dateTime: new Date(at + 15 * 60000).toISOString(), timeZone },
+    }),
+  })
+}

@@ -20,7 +20,9 @@ import {
   GoogleAuthError,
   connectGoogle,
   createGoogleEvent,
+  createGoogleReminder,
   deleteGoogleEvent,
+  moveGoogleReminder,
   disconnectGoogle,
   googleCalendarConfigured,
   googleConnected,
@@ -28,6 +30,21 @@ import {
   listGoogleEvents,
   type GoogleEvent,
 } from './lib/googleCalendar'
+import {
+  askDesktopPermission,
+  desktopPermission,
+  desktopSupported,
+  getPrefs,
+  markFired,
+  playTestTone,
+  savePrefs,
+  showDesktopNotification,
+  startRingtone,
+  stopRingtone,
+  unlockAudioOnFirstTouch,
+  wasFired,
+  type AlertPrefs,
+} from './lib/alerts'
 
 type Page = 'dashboard' | 'tasks' | 'calendar' | 'reminders' | 'notes' | 'focus' | 'medicine'
 type IconName =
@@ -65,7 +82,7 @@ type Task = {
   completed: boolean
 }
 
-type Reminder = { id: string; createdAt: number; title: string; remindAt: number; icon: IconName; color: Tone }
+type Reminder = { id: string; createdAt: number; title: string; remindAt: number; icon: IconName; color: Tone; viaGoogle?: boolean; googleId?: string }
 type Note = { id: string; createdAt: number; title: string; body: string; color: Tone; updatedAt: number }
 type PdfFile = { id: string; createdAt: number; name: string; size: number; chunkCount: number }
 type Medicine = { id: string; createdAt: number; name: string; detail: string; time24: string; color: Tone; takenOn: string }
@@ -930,46 +947,215 @@ const googleErrorText = (error: unknown) => {
   return message
 }
 
-function RemindersPage({ uid }: { uid: string }) {
-  const { items: reminders, add, update, remove } = useCollection<Reminder>(uid, 'reminders')
+type ReminderApi = {
+  reminders: Reminder[]
+  add: (data: Omit<Reminder, 'id' | 'createdAt'>) => Promise<unknown>
+  update: (id: string, data: Partial<Omit<Reminder, 'id' | 'createdAt'>>) => Promise<unknown>
+  remove: (id: string) => Promise<unknown>
+}
+
+/** Moves a reminder later (Snooze), keeping its Google Calendar alert in step when possible. */
+async function snoozeReminder(api: ReminderApi, reminder: Reminder, minutes = 10) {
+  const remindAt = Math.max(Date.now(), reminder.remindAt) + minutes * 60000
+  await api.update(reminder.id, { remindAt })
+  if (reminder.googleId && googleConnected()) {
+    try {
+      await moveGoogleReminder(reminder.googleId, remindAt)
+    } catch {
+      /* the UFlow alert still moves; the Google one can be fixed in Google Calendar */
+    }
+  }
+}
+
+/** Watches reminders on every page. Rings and pops up when one is due (only ones due within the last 2 minutes). */
+function ReminderAlerts({ api }: { api: ReminderApi }) {
+  const [ringing, setRinging] = useState<Reminder[]>([])
+  const latest = useRef(api.reminders)
+  latest.current = api.reminders
+
+  useEffect(() => unlockAudioOnFirstTouch(), [])
+
+  useEffect(() => {
+    const check = () => {
+      const prefs = getPrefs()
+      const due = latest.current.filter((reminder) => {
+        const late = Date.now() - reminder.remindAt
+        return late >= 0 && late < 120000 && !wasFired(`${reminder.id}@${reminder.remindAt}`)
+      })
+      if (due.length === 0) return
+      due.forEach((reminder) => markFired(`${reminder.id}@${reminder.remindAt}`))
+      if (!prefs.uflow) return
+      setRinging((current) => [...current, ...due.filter((reminder) => !current.some((item) => item.id === reminder.id))])
+      startRingtone()
+      due.forEach((reminder) => showDesktopNotification('UFlow reminder', reminder.title))
+    }
+    check()
+    const timer = window.setInterval(check, 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (ringing.length === 0) stopRingtone()
+  }, [ringing.length])
+
+  const close = (id: string) => setRinging((current) => current.filter((item) => item.id !== id))
+
+  if (ringing.length === 0) return null
+  return (
+    <div className="alert-stack" role="alert">
+      {ringing.map((reminder) => (
+        <div className="alert-toast" key={reminder.id}>
+          <span className="alert-toast-icon"><Icon name="bell" size={18} /></span>
+          <div>
+            <small>REMINDER</small>
+            <strong>{reminder.title}</strong>
+            <div className="alert-toast-actions">
+              <Button className="light-button" onClick={() => { void snoozeReminder(api, reminder); close(reminder.id) }}>Snooze 10 min</Button>
+              <Button className="primary-button" onClick={() => close(reminder.id)}>Got it</Button>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function RemindersPage({ api, email }: { api: ReminderApi; email: string | null }) {
+  const { reminders, add, update, remove } = api
   const [composerOpen, setComposerOpen] = useState(false)
   const [title, setTitle] = useState('')
   const [date, setDate] = useState(todayKey())
   const [time, setTime] = useState('09:00')
   const [now, setNow] = useState(Date.now())
+  const [prefs, setPrefs] = useState<AlertPrefs>(getPrefs)
+  const [viaGoogle, setViaGoogle] = useState(prefs.google)
+  const [permission, setPermission] = useState(desktopPermission())
+  const [notice, setNotice] = useState('')
+  const [connecting, setConnecting] = useState(false)
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30000)
     return () => window.clearInterval(timer)
   }, [])
 
+  const changePrefs = (patch: Partial<AlertPrefs>) => {
+    const next = { ...prefs, ...patch }
+    setPrefs(next)
+    savePrefs(next)
+  }
+
   const sorted = [...reminders].sort((a, b) => a.remindAt - b.remindAt)
   const next = sorted.find((reminder) => reminder.remindAt > now)
+  const googleReady = googleConnected()
+  const pending = reminders.filter((reminder) => reminder.viaGoogle && !reminder.googleId && reminder.remindAt > now)
 
-  const addReminder = () => {
-    if (!title.trim() || !date || !time) return
-    add({ title: title.trim(), remindAt: new Date(`${date}T${time}`).getTime(), icon: 'bell', color: tones[reminders.length % tones.length] })
+  const connect = async () => {
+    setConnecting(true)
+    setNotice('')
+    try {
+      await connectGoogle(email)
+    } catch (error) {
+      setNotice(googleErrorText(error))
+    }
+    setConnecting(false)
+  }
+
+  const addReminder = async () => {
+    if (!title.trim() || !date || !time || busy) return
+    setBusy(true)
+    const remindAt = new Date(`${date}T${time}`).getTime()
+    const data: Omit<Reminder, 'id' | 'createdAt'> = { title: title.trim(), remindAt, icon: 'bell', color: tones[reminders.length % tones.length] }
+    let message = ''
+    if (viaGoogle) {
+      data.viaGoogle = true
+      if (googleConnected()) {
+        try {
+          data.googleId = await createGoogleReminder(data.title, remindAt)
+        } catch (error) {
+          message = `Saved in UFlow, but the Google Calendar alert wasn’t created. ${googleErrorText(error)}`
+        }
+      } else {
+        message = 'Saved in UFlow. Connect Google Calendar to add its phone alert.'
+      }
+    }
+    await add(data)
+    setNotice(message)
     setTitle('')
+    setBusy(false)
     setComposerOpen(false)
   }
+
+  const addPending = async () => {
+    setBusy(true)
+    let failure = ''
+    for (const reminder of pending) {
+      try {
+        const googleId = await createGoogleReminder(reminder.title, reminder.remindAt)
+        await update(reminder.id, { googleId })
+      } catch (error) {
+        failure = googleErrorText(error)
+        break
+      }
+    }
+    setNotice(failure ? `Some alerts weren’t added. ${failure}` : '')
+    setBusy(false)
+  }
+
+  const removeReminder = async (reminder: Reminder) => {
+    let message = ''
+    if (reminder.googleId) {
+      if (googleConnected()) {
+        try {
+          await deleteGoogleEvent(reminder.googleId)
+        } catch (error) {
+          message = `Deleted in UFlow, but not in Google Calendar. ${googleErrorText(error)}`
+        }
+      } else {
+        message = 'Deleted in UFlow. Its Google Calendar alert is still there; connect Google Calendar and delete it there if you don’t want it.'
+      }
+    }
+    setNotice(message)
+    await remove(reminder.id)
+  }
+
+  const turnOnDesktop = async () => setPermission(await askDesktopPermission())
 
   return (
     <>
       <div className="heading-with-action">
         <PageHeading page="reminders" />
-        <Button className="primary-button" onClick={() => setComposerOpen(!composerOpen)}><Icon name="plus" size={17} /> Set reminder</Button>
+        <Button className="primary-button" onClick={() => { setViaGoogle(prefs.google); setComposerOpen(!composerOpen) }}><Icon name="plus" size={17} /> Set reminder</Button>
       </div>
       {composerOpen && (
         <section className="reminder-composer panel">
           <label><span>REMINDER TITLE</span><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && addReminder()} placeholder="What should we remind you about?" /></label>
           <label><span>DATE</span><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label>
           <label><span>TIME</span><input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label>
-          <Button className="primary-button" onClick={addReminder}>Save reminder</Button>
+          <Button className="primary-button" onClick={addReminder} disabled={busy}>{busy ? 'Saving…' : 'Save reminder'}</Button>
+          {googleCalendarConfigured && (
+            <div className="reminder-google-row">
+              <label className="tick-row">
+                <input type="checkbox" checked={viaGoogle} onChange={(event) => setViaGoogle(event.target.checked)} />
+                <span>Also alert me through Google Calendar <small>(rings on your phone even when UFlow is closed)</small></span>
+              </label>
+              {viaGoogle && !googleReady && (
+                <Button className="sync-button" onClick={connect} disabled={connecting}><Icon name="calendar" size={16} /> {connecting ? 'Connecting…' : googleWasLinked() ? 'Reconnect Google Calendar' : 'Connect Google Calendar'}</Button>
+              )}
+            </div>
+          )}
         </section>
+      )}
+      {notice && <p className="cal-notice">{notice}</p>}
+      {pending.length > 0 && googleReady && (
+        <p className="cal-notice">
+          {plural(pending.length, 'reminder')} {pending.length === 1 ? 'is' : 'are'} waiting for a Google Calendar alert.{' '}
+          <button className="inline-link" type="button" onClick={addPending} disabled={busy}>Add {pending.length === 1 ? 'it' : 'them'} now</button>
+        </p>
       )}
       <section className="reminder-summary">
         <div><span className="summary-icon"><Icon name="bell" /></span><span><small>NEXT REMINDER</small><strong>{next ? next.title : 'Nothing scheduled'}</strong><p>{next ? timeUntil(next.remindAt, now) : 'Add a reminder to stay on track.'}</p></span></div>
-        {next && <Button className="light-button" onClick={() => update(next.id, { remindAt: next.remindAt + 10 * 60000 })}>Snooze for 10 min</Button>}
+        {next && <Button className="light-button" onClick={() => snoozeReminder(api, next)}>Snooze for 10 min</Button>}
       </section>
       <section className="reminder-layout">
         <article className="panel reminder-list">
@@ -979,8 +1165,12 @@ function RemindersPage({ uid }: { uid: string }) {
             return (
               <div className={`reminder-row ${status}`} key={reminder.id}>
                 <span className={`reminder-icon ${reminder.color}`}><Icon name={reminder.icon} /></span>
-                <div><strong>{reminder.title}</strong><span>{formatWhen(reminder.remindAt)} · At scheduled time</span>{status === 'missed' && <em>Missed reminder — review now</em>}</div>
-                <Button className="icon-button delete-button" onClick={() => remove(reminder.id)} ariaLabel={`Delete ${reminder.title}`}><Icon name="trash" size={15} /></Button>
+                <div>
+                  <strong>{reminder.title}</strong>
+                  <span>{formatWhen(reminder.remindAt)} · {reminder.googleId ? 'UFlow + Google Calendar' : reminder.viaGoogle ? 'UFlow · Google alert pending' : 'UFlow only'}</span>
+                  {status === 'missed' && <em>Missed reminder — review now</em>}
+                </div>
+                <Button className="icon-button delete-button" onClick={() => removeReminder(reminder)} ariaLabel={`Delete ${reminder.title}`}><Icon name="trash" size={15} /></Button>
               </div>
             )
           })}
@@ -989,10 +1179,15 @@ function RemindersPage({ uid }: { uid: string }) {
         <aside className="panel reminder-settings">
           <span>NOTIFICATION SETTINGS</span>
           <strong>Stay in control.</strong>
-          <label><span><b>Task deadlines</b><small>30 minutes before</small></span><input type="checkbox" defaultChecked /></label>
-          <label><span><b>Class reminders</b><small>15 minutes before</small></span><input type="checkbox" defaultChecked /></label>
-          <label><span><b>Missed alerts</b><small>Send a follow-up</small></span><input type="checkbox" defaultChecked /></label>
-          <label><span><b>Focus completion</b><small>Sound and in-app alert</small></span><input type="checkbox" defaultChecked /></label>
+          <label><span><b>UFlow pop-up and ringtone</b><small>Needs UFlow open in a tab</small></span><input type="checkbox" checked={prefs.uflow} onChange={(event) => changePrefs({ uflow: event.target.checked })} /></label>
+          <label><span><b>Google Calendar alerts</b><small>{googleCalendarConfigured ? 'Ticked by default for new reminders' : 'Add your Google client ID first'}</small></span><input type="checkbox" checked={prefs.google} disabled={!googleCalendarConfigured} onChange={(event) => changePrefs({ google: event.target.checked })} /></label>
+          <div className="alert-tools">
+            <Button className="outline-button" onClick={playTestTone}>Test ringtone</Button>
+            {desktopSupported() && permission !== 'granted' && (
+              <Button className="outline-button" onClick={turnOnDesktop} disabled={permission === 'denied'}>{permission === 'denied' ? 'Desktop alerts blocked' : 'Turn on desktop alerts'}</Button>
+            )}
+            {permission === 'granted' && <small>Desktop alerts are on.</small>}
+          </div>
         </aside>
       </section>
     </>
@@ -1414,6 +1609,8 @@ function SetupNeeded() {
 function Workspace({ user }: { user: User }) {
   const [page, setPage] = useState<Page>('dashboard')
   const { items: tasks, add: addTaskDoc, update: updateTaskDoc, remove: deleteTask } = useCollection<Task>(user.uid, 'tasks')
+  const { items: reminders, add: addReminderDoc, update: updateReminderDoc, remove: removeReminderDoc } = useCollection<Reminder>(user.uid, 'reminders')
+  const reminderApi: ReminderApi = { reminders, add: addReminderDoc, update: updateReminderDoc, remove: removeReminderDoc }
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [syncError, setSyncError] = useState(false)
@@ -1492,12 +1689,14 @@ function Workspace({ user }: { user: User }) {
           {page === 'dashboard' && <Dashboard tasks={tasks} toggleTask={toggleTask} navigate={navigate} name={name} />}
           {page === 'tasks' && <TasksPage tasks={tasks} toggleTask={toggleTask} addTask={addTask} updateTask={updateTask} deleteTask={deleteTask} />}
           {page === 'calendar' && <CalendarPage uid={user.uid} email={user.email} />}
-          {page === 'reminders' && <RemindersPage uid={user.uid} />}
+          {page === 'reminders' && <RemindersPage api={reminderApi} email={user.email} />}
           {page === 'notes' && <NotesPage uid={user.uid} />}
           {page === 'focus' && <FocusPage name={name} />}
           {page === 'medicine' && <MedicinePage uid={user.uid} />}
         </main>
       </div>
+
+      <ReminderAlerts api={reminderApi} />
 
       <nav className="mobile-nav">
         {navItems.slice(0, 5).map((item) => (
