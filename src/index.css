@@ -621,3 +621,11 @@
 @keyframes toast-ring { 0%, 100% { transform: rotate(0); } 20% { transform: rotate(-14deg); } 40% { transform: rotate(12deg); } 60% { transform: rotate(-8deg); } }
 @media (max-width: 760px) { .alert-stack { bottom: 5.2rem; right: 1rem; } }
 @media (prefers-reduced-motion: reduce) { .alert-toast, .alert-toast-icon { animation: none; } }
+
+/* ---------- ringtone picker ---------- */
+.tone-picker { border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: .55rem; padding: 1rem 0; }
+.tone-picker > span { color: var(--faint); font-size: .48rem; font-weight: 800; letter-spacing: .12em; }
+.tone-picker small { color: var(--muted); font-size: .52rem; line-height: 1.45; }
+.tone-select { background: var(--canvas); border: 1px solid var(--line); border-radius: .55rem; color: var(--ink); font-size: .65rem; height: 2.45rem; outline: none; padding: 0 .6rem; width: 100%; }
+.tone-actions { align-items: center; display: flex; flex-wrap: wrap; gap: .6rem; }
+.tone-error { color: oklch(.45 .15 30); font-weight: 600; }

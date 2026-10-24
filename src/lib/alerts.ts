@@ -10,9 +10,15 @@ export type AlertPrefs = {
   uflow: boolean
   /** Default for the "Also alert me through Google Calendar" tick box on new reminders. */
   google: boolean
+  /** Which ringtone: one of TONES, or 'custom' for the student's own file. */
+  tone: string
+  /** Vibrate with the ringtone (Android phones only). */
+  vibrate: boolean
+  /** File name shown for the custom ringtone. */
+  customName: string
 }
 
-const defaults: AlertPrefs = { uflow: true, google: true }
+const defaults: AlertPrefs = { uflow: true, google: true, tone: 'chime', vibrate: true, customName: '' }
 
 export const getPrefs = (): AlertPrefs => {
   try {
@@ -49,11 +55,26 @@ export const markFired = (key: string) => {
   }
 }
 
-/* ---------- ringtone (generated, no sound file needed) ---------- */
+/* ---------- ringtone (built-in tones are generated; students can also upload their own) ---------- */
+
+type Note = { f: number; at: number; len: number; type?: OscillatorType; vol?: number }
+
+export const TONES: { id: string; label: string; notes: Note[] }[] = [
+  { id: 'chime', label: 'Chime', notes: [880, 1174.66, 1318.51].map((f, i) => ({ f, at: i * 0.18, len: 0.5 })) },
+  { id: 'bell', label: 'Bell', notes: [{ f: 1046.5, at: 0, len: 1.3 }, { f: 2093, at: 0, len: 0.8, vol: 0.12 }, { f: 784, at: 0.55, len: 1.3 }, { f: 1568, at: 0.55, len: 0.8, vol: 0.12 }] },
+  { id: 'melody', label: 'Melody', notes: [523.25, 659.25, 783.99, 1046.5, 783.99, 1046.5].map((f, i) => ({ f, at: i * 0.2, len: 0.32, type: 'triangle' as const, vol: 0.4 })) },
+  { id: 'beep', label: 'Beep', notes: [0, 0.3, 0.6].map((at) => ({ f: 1000, at, len: 0.18, type: 'square' as const, vol: 0.18 })) },
+  { id: 'alarm', label: 'Alarm', notes: [0, 1, 2, 3, 4, 5].map((i) => ({ f: i % 2 ? 660 : 880, at: i * 0.16, len: 0.15, type: 'sawtooth' as const, vol: 0.16 })) },
+  { id: 'soft', label: 'Soft', notes: [{ f: 440, at: 0, len: 0.9, vol: 0.25 }, { f: 554.37, at: 0.35, len: 0.9, vol: 0.25 }, { f: 659.25, at: 0.7, len: 1.1, vol: 0.25 }] },
+]
+
+export const MAX_TONE_MB = 5
 
 let audio: AudioContext | null = null
 let ringTimer: number | undefined
 let stopTimer: number | undefined
+let customPlayer: HTMLAudioElement | null = null
+let customUrl: string | null = null
 
 const getAudio = () => {
   if (!audio) {
@@ -79,23 +100,89 @@ export function unlockAudioOnFirstTouch() {
   }
 }
 
-const chime = () => {
+/* The custom sound is kept in this browser (IndexedDB), so it stays on this device only. */
+const openDb = () =>
+  new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open('uflow-alerts', 1)
+    request.onupgradeneeded = () => request.result.createObjectStore('tones')
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+
+const dbRun = async <T,>(mode: IDBTransactionMode, action: (store: IDBObjectStore) => IDBRequest<T>) => {
+  const db = await openDb()
+  return new Promise<T>((resolve, reject) => {
+    const request = action(db.transaction('tones', mode).objectStore('tones'))
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+export async function saveCustomTone(file: File) {
+  if (!file.type.startsWith('audio/')) throw new Error('Choose an audio file (MP3, WAV, M4A or OGG).')
+  if (file.size > MAX_TONE_MB * 1024 * 1024) throw new Error(`That file is over ${MAX_TONE_MB} MB. Choose a shorter sound.`)
+  await dbRun('readwrite', (store) => store.put(file, 'custom'))
+  if (customUrl) URL.revokeObjectURL(customUrl)
+  customUrl = null
+  return file.name
+}
+
+export async function clearCustomTone() {
+  await dbRun('readwrite', (store) => store.delete('custom')).catch(() => undefined)
+  if (customUrl) URL.revokeObjectURL(customUrl)
+  customUrl = null
+}
+
+async function customToneUrl() {
+  if (customUrl) return customUrl
+  const blob = (await dbRun('readonly', (store) => store.get('custom')).catch(() => undefined)) as Blob | undefined
+  if (!blob) return null
+  customUrl = URL.createObjectURL(blob)
+  return customUrl
+}
+
+const playNotes = (notes: Note[]) => {
   const ctx = getAudio()
   if (!ctx || ctx.state !== 'running') return
   const start = ctx.currentTime
-  ;[880, 1174.66, 1318.51].forEach((frequency, index) => {
+  for (const note of notes) {
     const osc = ctx.createOscillator()
     const gain = ctx.createGain()
-    osc.type = 'sine'
-    osc.frequency.value = frequency
-    const at = start + index * 0.18
+    osc.type = note.type ?? 'sine'
+    osc.frequency.value = note.f
+    const at = start + note.at
     gain.gain.setValueAtTime(0.0001, at)
-    gain.gain.exponentialRampToValueAtTime(0.35, at + 0.02)
-    gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.5)
+    gain.gain.exponentialRampToValueAtTime(note.vol ?? 0.35, at + 0.02)
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + note.len)
     osc.connect(gain).connect(ctx.destination)
     osc.start(at)
-    osc.stop(at + 0.55)
-  })
+    osc.stop(at + note.len + 0.05)
+  }
+}
+
+/* ---------- vibration (Android Chrome; iPhones don’t allow it) ---------- */
+
+export const vibrationSupported = () => typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function'
+const buzz = () => {
+  try {
+    navigator.vibrate?.([500, 200, 500, 200, 500])
+  } catch {
+    /* ignore */
+  }
+}
+const stopBuzz = () => {
+  try {
+    navigator.vibrate?.(0)
+  } catch {
+    /* ignore */
+  }
+}
+
+const stopCustom = () => {
+  if (customPlayer) {
+    customPlayer.pause()
+    customPlayer.currentTime = 0
+  }
 }
 
 export function stopRingtone() {
@@ -103,18 +190,49 @@ export function stopRingtone() {
   window.clearTimeout(stopTimer)
   ringTimer = undefined
   stopTimer = undefined
+  stopCustom()
+  stopBuzz()
 }
 
-/** Repeats the chime every 2.5 seconds for up to 30 seconds, or until stopRingtone(). */
+async function playOnce(prefs: AlertPrefs, loop: boolean) {
+  if (prefs.tone === 'custom') {
+    const url = await customToneUrl()
+    if (url) {
+      customPlayer ??= new Audio()
+      if (customPlayer.src !== url) customPlayer.src = url
+      customPlayer.loop = loop
+      customPlayer.currentTime = 0
+      await customPlayer.play().catch(() => undefined)
+      return
+    }
+  }
+  const tone = TONES.find((item) => item.id === prefs.tone) ?? TONES[0]
+  await getAudio()?.resume()
+  playNotes(tone.notes)
+}
+
+/** Rings for up to 30 seconds (or until stopRingtone()), with vibration if switched on. */
 export function startRingtone(maxSeconds = 30) {
   if (ringTimer !== undefined) return
-  void getAudio()?.resume().then(chime)
-  ringTimer = window.setInterval(chime, 2500)
+  const prefs = getPrefs()
+  const round = () => {
+    // A custom sound loops by itself; built-in tones repeat every 2.5 seconds.
+    if (prefs.tone !== 'custom') void playOnce(prefs, false)
+    if (prefs.vibrate) buzz()
+  }
+  if (prefs.tone === 'custom') void playOnce(prefs, true)
+  round()
+  ringTimer = window.setInterval(round, 2500)
   stopTimer = window.setTimeout(stopRingtone, maxSeconds * 1000)
 }
 
-export function playTestTone() {
-  void getAudio()?.resume().then(chime)
+/** Plays the chosen tone once (about 5 seconds for a custom file), with a short buzz. */
+export function playTestTone(overrides: Partial<AlertPrefs> = {}) {
+  stopRingtone()
+  const prefs = { ...getPrefs(), ...overrides }
+  void playOnce(prefs, false)
+  if (prefs.vibrate) buzz()
+  if (prefs.tone === 'custom') stopTimer = window.setTimeout(stopRingtone, 5000)
 }
 
 /* ---------- desktop notifications ---------- */

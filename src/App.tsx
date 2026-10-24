@@ -31,17 +31,21 @@ import {
   type GoogleEvent,
 } from './lib/googleCalendar'
 import {
+  TONES,
   askDesktopPermission,
+  clearCustomTone,
   desktopPermission,
   desktopSupported,
   getPrefs,
   markFired,
   playTestTone,
+  saveCustomTone,
   savePrefs,
   showDesktopNotification,
   startRingtone,
   stopRingtone,
   unlockAudioOnFirstTouch,
+  vibrationSupported,
   wasFired,
   type AlertPrefs,
 } from './lib/alerts'
@@ -1033,6 +1037,8 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
   const [notice, setNotice] = useState('')
   const [connecting, setConnecting] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [toneError, setToneError] = useState('')
+  const toneFile = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30000)
@@ -1119,6 +1125,31 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
     await remove(reminder.id)
   }
 
+  const chooseTone = (tone: string) => {
+    changePrefs({ tone })
+    setToneError('')
+    playTestTone({ tone })
+  }
+
+  const pickToneFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    try {
+      const customName = await saveCustomTone(file)
+      changePrefs({ tone: 'custom', customName })
+      setToneError('')
+      playTestTone({ tone: 'custom' })
+    } catch (error) {
+      setToneError(error instanceof Error ? error.message : 'Couldn’t use that file.')
+    }
+  }
+
+  const removeTone = async () => {
+    await clearCustomTone()
+    changePrefs({ tone: 'chime', customName: '' })
+  }
+
   const turnOnDesktop = async () => setPermission(await askDesktopPermission())
 
   return (
@@ -1181,8 +1212,23 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
           <strong>Stay in control.</strong>
           <label><span><b>UFlow pop-up and ringtone</b><small>Needs UFlow open in a tab</small></span><input type="checkbox" checked={prefs.uflow} onChange={(event) => changePrefs({ uflow: event.target.checked })} /></label>
           <label><span><b>Google Calendar alerts</b><small>{googleCalendarConfigured ? 'Ticked by default for new reminders' : 'Add your Google client ID first'}</small></span><input type="checkbox" checked={prefs.google} disabled={!googleCalendarConfigured} onChange={(event) => changePrefs({ google: event.target.checked })} /></label>
+          <label><span><b>Vibration</b><small>{vibrationSupported() ? 'Buzz along with the ringtone' : 'Not available on this device (Android phones only)'}</small></span><input type="checkbox" checked={prefs.vibrate} disabled={!vibrationSupported()} onChange={(event) => { changePrefs({ vibrate: event.target.checked }); if (event.target.checked) playTestTone({ vibrate: true }) }} /></label>
+          <div className="tone-picker">
+            <span>RINGTONE</span>
+            <select className="tone-select" value={prefs.tone} onChange={(event) => chooseTone(event.target.value)} aria-label="Choose ringtone">
+              {TONES.map((tone) => <option key={tone.id} value={tone.id}>{tone.label}</option>)}
+              {prefs.customName && <option value="custom">My sound: {prefs.customName}</option>}
+            </select>
+            <div className="tone-actions">
+              <Button className="outline-button" onClick={() => toneFile.current?.click()}>{prefs.customName ? 'Replace my sound' : 'Upload my own sound'}</Button>
+              {prefs.customName && <Button className="text-button muted-link" onClick={removeTone}>Remove</Button>}
+            </div>
+            <input ref={toneFile} type="file" accept="audio/*" hidden onChange={pickToneFile} />
+            <small>MP3, WAV, M4A or OGG, up to 5 MB. It’s saved on this device only, so upload it again on your phone or other computer.</small>
+            {toneError && <small className="tone-error">{toneError}</small>}
+          </div>
           <div className="alert-tools">
-            <Button className="outline-button" onClick={playTestTone}>Test ringtone</Button>
+            <Button className="outline-button" onClick={() => playTestTone()}>Test ringtone</Button>
             {desktopSupported() && permission !== 'granted' && (
               <Button className="outline-button" onClick={turnOnDesktop} disabled={permission === 'denied'}>{permission === 'denied' ? 'Desktop alerts blocked' : 'Turn on desktop alerts'}</Button>
             )}
