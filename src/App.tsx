@@ -15,7 +15,7 @@ import {
 } from 'firebase/auth'
 import { auth, firebaseReady } from './lib/firebase'
 import { SYNC_ERROR_EVENT, useCollection } from './lib/useCollection'
-import { MAX_FILE_BYTES, deletePdf, fetchPdfBlob, uploadPdf } from './lib/files'
+import { MAX_FILE_BYTES, MAX_FILE_MB, deletePdf, fetchPdfBlob, uploadPdf } from './lib/files'
 import {
   GoogleAuthError,
   connectGoogle,
@@ -1056,7 +1056,7 @@ function NotesPage({ uid }: { uid: string }) {
       return
     }
     if (file.size > MAX_FILE_BYTES) {
-      setUploadError(`That file is ${formatSize(file.size)}. The limit is 5 MB.`)
+      setUploadError(`That file is ${formatSize(file.size)}. The limit is ${MAX_FILE_MB} MB.`)
       return
     }
     setUploadError('')
@@ -1137,7 +1137,7 @@ function NotesPage({ uid }: { uid: string }) {
             <Button className="icon-button delete-button" ariaLabel={`Delete ${file.name}`} onClick={() => removeFile(file)}><Icon name="trash" size={15} /></Button>
           </div>
         ))}
-        {files.length === 0 && !uploadError && <div className="empty-state"><Icon name="book" size={28} /><strong>No PDFs yet</strong><span>Tap “Upload PDF” to add lecture slides or study guides (up to 5 MB each).</span></div>}
+        {files.length === 0 && !uploadError && <div className="empty-state"><Icon name="book" size={28} /><strong>No PDFs yet</strong><span>Tap “Upload PDF” to add lecture slides or study guides (up to {MAX_FILE_MB} MB each).</span></div>}
       </section>
       {activeNote && (
         <div className="modal-layer">

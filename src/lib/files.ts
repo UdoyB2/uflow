@@ -7,7 +7,8 @@ import { db } from './firebase'
  *   users/{uid}/files/{fileId}                 -> name, size, chunkCount
  *   users/{uid}/files/{fileId}/chunks/{000...} -> a slice of the file as text
  */
-export const MAX_FILE_BYTES = 5 * 1024 * 1024
+export const MAX_FILE_MB = 25
+export const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 const CHUNK_CHARS = 800_000 // stays safely under Firestore’s 1 MiB document limit
 
 const readAsBase64 = (file: File) =>
