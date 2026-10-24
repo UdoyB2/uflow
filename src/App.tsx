@@ -22,7 +22,7 @@ import {
   createGoogleEvent,
   createGoogleReminder,
   deleteGoogleEvent,
-  moveGoogleReminder,
+  updateGoogleReminder,
   disconnectGoogle,
   googleCalendarConfigured,
   googleConnected,
@@ -36,11 +36,15 @@ import {
   clearCustomTone,
   desktopPermission,
   desktopSupported,
+  addSeen,
   getPrefs,
+  getSeen,
+  getSnooze,
   markFired,
   playTestTone,
   saveCustomTone,
   savePrefs,
+  setSnooze,
   showDesktopNotification,
   startRingtone,
   stopRingtone,
@@ -84,12 +88,18 @@ type Task = {
   points: number
   color: Tone
   completed: boolean
+  /** Optional due time (0 or missing means none). */
+  dueAt?: number
+  completedAt?: number
+  viaGoogle?: boolean
+  googleId?: string
 }
 
 type Reminder = { id: string; createdAt: number; title: string; remindAt: number; icon: IconName; color: Tone; viaGoogle?: boolean; googleId?: string }
 type Note = { id: string; createdAt: number; title: string; body: string; color: Tone; updatedAt: number }
 type PdfFile = { id: string; createdAt: number; name: string; size: number; chunkCount: number }
-type Medicine = { id: string; createdAt: number; name: string; detail: string; time24: string; color: Tone; takenOn: string }
+type Medicine = { id: string; createdAt: number; name: string; detail: string; time24: string; color: Tone; takenOn: string; takenDays?: string[]; viaGoogle?: boolean; googleId?: string }
+type FocusSession = { id: string; createdAt: number; minutes: number; day: string }
 
 const pct = (done: number, total: number) => (total ? (done / total) * 100 : 0)
 const formatSize = (bytes: number) => (bytes < 1048576 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1048576).toFixed(1)} MB`)
@@ -315,18 +325,55 @@ function TaskCheck({ checked, onClick }: { checked: boolean; onClick: () => void
   )
 }
 
-function Dashboard({
-  tasks,
-  toggleTask,
-  navigate,
-  name,
-}: {
-  tasks: Task[]
-  toggleTask: (id: string) => void
-  navigate: (page: Page) => void
-  name: string
-}) {
+type Overview = { tasks: Task[]; reminders: Reminder[]; medicines: Medicine[]; events: CalEvent[]; focus: FocusSession[] }
+
+function Dashboard({ data, toggleTask, navigate, name }: { data: Overview; toggleTask: (id: string) => void; navigate: (page: Page) => void; name: string }) {
+  const { tasks, reminders, medicines, events, focus } = data
+  const today = todayKey()
+  const nowMs = Date.now()
   const completed = tasks.filter((task) => task.completed).length
+  const open = tasks.length - completed
+  const xp = tasks.filter((task) => task.completed).reduce((sum, task) => sum + task.points, 0)
+  const focusToday = focus.filter((session) => session.day === today).reduce((sum, session) => sum + session.minutes, 0)
+  const takenToday = medicines.filter((medicine) => tookOn(medicine, today)).length
+
+  // Streak: days in a row with a finished task or a focus session.
+  const activeDays = new Set<string>([...tasks.filter((task) => task.completed && task.completedAt).map((task) => dayKey(task.completedAt as number)), ...focus.map((session) => session.day)])
+  const streak = countStreak((day) => activeDays.has(day))
+
+  // Flow score: average of task progress, focus vs your 3-hour goal, and today’s medicine (only counted if you have medicine).
+  const parts = [Math.min(100, (focusToday / FOCUS_GOAL_MIN) * 100)]
+  if (tasks.length) parts.push(pct(completed, tasks.length))
+  if (medicines.length) parts.push(pct(takenToday, medicines.length))
+  const score = Math.round(parts.reduce((sum, value) => sum + value, 0) / parts.length)
+
+  const nudge =
+    tasks.length === 0 ? 'Add your first task and get your day moving.'
+    : open === 0 ? 'Every task is done. Enjoy the win!'
+    : open === 1 ? 'You’re one task away from clearing your list.'
+    : `${open} tasks left. Take them one at a time.`
+
+  // Today’s schedule from your own data: events, reminders, medicine still to take, and tasks due today.
+  const slots: { key: string; sort: number; time: string; tone: string; title: string; sub: string }[] = []
+  for (const event of events) {
+    if (dayKey(event.start) !== today) continue
+    slots.push({ key: `e${event.id}`, sort: event.allDay ? 0 : event.start, time: event.allDay ? 'All day' : hhmm(event.start), tone: event.color === 'purple' ? 'blue' : event.color, title: event.title, sub: event.location || (event.allDay ? 'All-day event' : `${Math.max(1, Math.round((event.end - event.start) / 60000))} min`) })
+  }
+  for (const reminder of reminders) {
+    if (dayKey(reminder.remindAt) === today) slots.push({ key: `r${reminder.id}`, sort: reminder.remindAt, time: hhmm(reminder.remindAt), tone: 'coral', title: reminder.title, sub: 'Reminder' })
+  }
+  for (const medicine of medicines) {
+    if (!tookOn(medicine, today)) slots.push({ key: `m${medicine.id}`, sort: atTime(today, medicine.time24), time: medicine.time24, tone: 'yellow', title: medicine.name, sub: medicine.detail || 'Medicine' })
+  }
+  for (const task of tasks) {
+    if (!task.completed && task.dueAt && dayKey(task.dueAt) === today) slots.push({ key: `t${task.id}`, sort: task.dueAt, time: hhmm(task.dueAt), tone: 'blue', title: task.title, sub: 'Task due' })
+  }
+  slots.sort((a, b) => a.sort - b.sort)
+
+  const pendingMeds = medicines.filter((medicine) => !tookOn(medicine, today)).sort((a, b) => a.time24.localeCompare(b.time24))
+  const nextMed = pendingMeds.find((medicine) => atTime(today, medicine.time24) >= nowMs - 30 * 60000) ?? pendingMeds[0]
+  const shownTasks = [...tasks].sort((a, b) => Number(a.completed) - Number(b.completed)).slice(0, 3)
+
   return (
     <>
       <PageHeading page="dashboard" name={name} />
@@ -336,21 +383,21 @@ function Dashboard({
         <div className="welcome-copy">
           <span><Icon name="spark" size={13} /> YOUR DAILY FLOW</span>
           <div role="heading" aria-level={2}>Hey {name}, make today count.</div>
-          <p>You’re one task away from a new productivity streak.</p>
+          <p>{nudge}</p>
           <Button className="light-button" onClick={() => navigate('tasks')}>View today’s plan <Icon name="arrow" size={15} /></Button>
         </div>
-        <div className="day-score"><strong>82</strong><span>FLOW SCORE</span></div>
+        <div className="day-score" title="Average of task progress, focus time vs a 3-hour goal, and medicine taken today"><strong>{score}</strong><span>FLOW SCORE</span></div>
       </section>
 
       <section className="stats-row">
         <article className="stat-card streak-stat">
           <span className="stat-icon"><Icon name="spark" /></span>
-          <div><small>CURRENT STREAK</small><strong>4 days</strong><span>Keep showing up!</span></div>
-          <em>+120 XP</em>
+          <div><small>CURRENT STREAK</small><strong>{plural(streak, 'day')}</strong><span>{streak > 0 ? 'Keep showing up!' : 'Finish a task or focus to start one'}</span></div>
+          <em>{xp} XP</em>
         </article>
         <article className="stat-card">
           <span className="stat-icon blue"><Icon name="clock" /></span>
-          <div><small>FOCUS TODAY</small><strong>2h 35m</strong><span>12% above average</span></div>
+          <div><small>FOCUS TODAY</small><strong>{fmtMinutes(focusToday)}</strong><span>{Math.round((focusToday / FOCUS_GOAL_MIN) * 100)}% of your {FOCUS_GOAL_MIN / 60}h goal</span></div>
         </article>
         <article className="stat-card">
           <span className="stat-icon green"><Icon name="task" /></span>
@@ -365,42 +412,48 @@ function Dashboard({
             <Button className="text-button" onClick={() => navigate('tasks')}>View all <Icon name="arrow" size={14} /></Button>
           </div>
           <div className="dashboard-task-list">
-            {tasks.slice(0, 3).map((task) => (
+            {shownTasks.map((task) => (
               <div className={`dashboard-task ${task.completed ? 'done' : ''}`} key={task.id}>
                 <TaskCheck checked={task.completed} onClick={() => toggleTask(task.id)} />
                 <span className={`task-color ${task.color}`} />
-                <div><strong>{task.title}</strong><span>{task.course} · {task.time || 'Today'}</span></div>
+                <div><strong>{task.title}</strong><span>{task.course} · {task.dueAt ? formatWhen(task.dueAt) : 'No due date'}</span></div>
                 <em>+{task.points} XP</em>
               </div>
             ))}
             {tasks.length === 0 && <div className="empty-state"><Icon name="spark" size={28} /><strong>No quests yet</strong><span>Add your first task to get going.</span></div>}
           </div>
-          <div className="task-progress-copy"><span>{completed} completed today</span><b>{Math.round(pct(completed, tasks.length))}%</b></div>
+          <div className="task-progress-copy"><span>{completed} of {tasks.length} completed</span><b>{Math.round(pct(completed, tasks.length))}%</b></div>
           <ProgressBar value={pct(completed, tasks.length)} />
         </article>
 
         <article className="panel schedule-panel">
           <div className="panel-heading">
             <div><span>NEXT UP</span><strong>Today’s schedule</strong></div>
-            <span className="date-chip">MAY 14</span>
+            <span className="date-chip">{new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }).toUpperCase()}</span>
           </div>
-          <div className="timeline">
-            <div><time>10:30</time><i className="yellow" /><span><b>Software Engineering</b><small>Room 405 · 45 min</small></span></div>
-            <div><time>12:30</time><i className="coral" /><span><b>Lunch break</b><small>Campus café · 30 min</small></span></div>
-            <div><time>03:00</time><i className="blue" /><span><b>Project group sync</b><small>Library · 1 hour</small></span></div>
+          <div className="timeline wide">
+            {slots.slice(0, 5).map((slot) => (
+              <div key={slot.key}><time>{slot.time}</time><i className={slot.tone} /><span><b>{slot.title}</b><small>{slot.sub}</small></span></div>
+            ))}
+            {slots.length === 0 && <div className="empty-state"><Icon name="calendar" size={28} /><strong>Nothing planned today</strong><span>Events, reminders and doses will show up here.</span></div>}
+            {slots.length > 5 && <p className="timeline-more">+{slots.length - 5} more today</p>}
           </div>
           <Button className="outline-button full-button" onClick={() => navigate('calendar')}>Open calendar <Icon name="calendar" size={15} /></Button>
         </article>
 
         <article className="focus-promo">
           <span className="promo-icon"><Icon name="clock" /></span>
-          <div><small>FOCUS SESSION</small><strong>Ready for 25 minutes?</strong><p>Your next break is closer than you think.</p></div>
+          <div><small>FOCUS SESSION</small><strong>Ready for 25 minutes?</strong><p>{focusToday > 0 ? `${fmtMinutes(focusToday)} focused today. Keep it going.` : 'Start a session and build your streak.'}</p></div>
           <Button className="dark-round" ariaLabel="Start focus session" onClick={() => navigate('focus')}><Icon name="play" size={17} /></Button>
         </article>
 
         <article className="medicine-promo">
           <span className="promo-icon"><Icon name="pill" /></span>
-          <div><small>NEXT MEDICINE · 8:00 PM</small><strong>Vitamin D</strong><p>1 tablet · After dinner</p></div>
+          {nextMed ? (
+            <div><small>NEXT MEDICINE · {formatTime(nextMed.time24).toUpperCase()}</small><strong>{nextMed.name}</strong><p>{nextMed.detail || 'Time for your dose'}</p></div>
+          ) : (
+            <div><small>MEDICINE</small><strong>{medicines.length ? 'All doses taken' : 'No medicine yet'}</strong><p>{medicines.length ? 'Nice work today.' : 'Add one to get dose alerts.'}</p></div>
+          )}
           <Button className="text-button" onClick={() => navigate('medicine')}>Details <Icon name="arrow" size={14} /></Button>
         </article>
       </section>
@@ -408,48 +461,114 @@ function Dashboard({
   )
 }
 
-function TasksPage({
-  tasks,
-  toggleTask,
-  addTask,
-  updateTask,
-  deleteTask,
-}: {
-  tasks: Task[]
-  toggleTask: (id: string) => void
-  addTask: (title: string) => void
-  updateTask: (id: string, title: string) => void
-  deleteTask: (id: string) => void
-}) {
+function TasksPage({ coll, toggleTask, email, launch, clearLaunch }: { coll: Coll<Task>; toggleTask: (id: string) => void; email: string | null; launch: boolean; clearLaunch: () => void }) {
+  const tasks = coll.items
   const [filter, setFilter] = useState<'all' | 'active' | 'done'>('all')
   const [composerOpen, setComposerOpen] = useState(false)
   const [newTitle, setNewTitle] = useState('')
+  const [newDate, setNewDate] = useState('')
+  const [newTime, setNewTime] = useState('09:00')
+  const [viaGoogle, setViaGoogle] = useState(getPrefs().google)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [deleteId, setDeleteId] = useState<string | null>(null)
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [now, setNow] = useState(Date.now())
   const visibleTasks = tasks.filter((task) => filter === 'all' || (filter === 'done' ? task.completed : !task.completed))
   const completed = tasks.filter((task) => task.completed).length
   const xp = tasks.filter((task) => task.completed).reduce((sum, task) => sum + task.points, 0)
 
-  const submitTask = () => {
-    if (!newTitle.trim()) return
-    if (editingId) updateTask(editingId, newTitle.trim())
-    else addTask(newTitle.trim())
-    setNewTitle('')
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const resetForm = () => {
     setEditingId(null)
+    setNewTitle('')
+    setNewDate('')
+    setNewTime('09:00')
+    setViaGoogle(getPrefs().google)
+  }
+
+  useEffect(() => {
+    if (!launch) return
+    clearLaunch()
+    resetForm()
+    setComposerOpen(true)
+  }, [launch, clearLaunch])
+
+  const submitTask = async () => {
+    const title = newTitle.trim()
+    if (!title || busy) return
+    const dueAt = newDate ? new Date(`${newDate}T${newTime || '09:00'}`).getTime() : 0
+    setBusy(true)
+    let message = ''
+    if (editingId) {
+      const task = tasks.find((item) => item.id === editingId)
+      const patch: Partial<Omit<Task, 'id' | 'createdAt'>> = { title, dueAt }
+      if (task?.googleId) {
+        if (!googleConnected()) {
+          message = 'Saved in UFlow, but its Google Calendar alert wasn’t updated because Google isn’t connected.'
+        } else {
+          try {
+            if (dueAt) {
+              await updateGoogleReminder(task.googleId, { title, icon: '✅', at: dueAt })
+            } else {
+              await deleteGoogleEvent(task.googleId)
+              patch.googleId = ''
+            }
+          } catch (error) {
+            message = `Saved in UFlow, but Google Calendar wasn’t updated. ${googleErrorText(error)}`
+          }
+        }
+      } else if (dueAt && viaGoogle && !task?.completed) {
+        const result = await makeGoogleAlert(title, dueAt, { icon: '✅', note: 'Task due, from UFlow' })
+        if (result.googleId) {
+          patch.googleId = result.googleId
+          patch.viaGoogle = true
+        }
+        message = result.message
+      }
+      await coll.update(editingId, patch)
+    } else {
+      const data: Omit<Task, 'id' | 'createdAt'> = { title, course: 'Personal', time: '', points: 20, color: tones[tasks.length % tones.length], completed: false, dueAt }
+      if (dueAt && viaGoogle) {
+        data.viaGoogle = true
+        const result = await makeGoogleAlert(title, dueAt, { icon: '✅', note: 'Task due, from UFlow' })
+        if (result.googleId) data.googleId = result.googleId
+        message = result.message
+      }
+      await coll.add(data)
+    }
+    setNotice(message)
+    resetForm()
+    setBusy(false)
     setComposerOpen(false)
   }
 
   const editTask = (task: Task) => {
     setEditingId(task.id)
     setNewTitle(task.title)
+    setNewDate(task.dueAt ? dayKey(task.dueAt) : '')
+    setNewTime(task.dueAt ? hhmm(task.dueAt) : '09:00')
+    setViaGoogle(task.viaGoogle ?? getPrefs().google)
     setComposerOpen(true)
+  }
+
+  const confirmDelete = async () => {
+    const task = tasks.find((item) => item.id === deleteId)
+    setDeleteId(null)
+    if (!task) return
+    setNotice(await dropGoogleAlert(task.googleId, 'Deleted'))
+    await coll.remove(task.id)
   }
 
   return (
     <>
       <div className="heading-with-action">
         <PageHeading page="tasks" />
-        <Button className="primary-button" onClick={() => setComposerOpen(!composerOpen)}><Icon name="plus" size={17} /> New task</Button>
+        <Button className="primary-button" onClick={() => { if (composerOpen) { resetForm(); setComposerOpen(false) } else { resetForm(); setComposerOpen(true) } }}><Icon name="plus" size={17} /> New task</Button>
       </div>
 
       <section className="task-summary">
@@ -458,13 +577,23 @@ function TasksPage({
       </section>
 
       {composerOpen && (
-        <section className="task-composer">
-          <span className="composer-icon"><Icon name="task" /></span>
-          <label><span>{editingId ? 'Update your task' : 'What needs to be done?'}</span><input autoFocus value={newTitle} onChange={(event) => setNewTitle(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && submitTask()} placeholder="e.g. Finish chapter 5 notes" /></label>
-          {editingId && <Button className="outline-button" onClick={() => { setEditingId(null); setNewTitle(''); setComposerOpen(false) }}>Cancel</Button>}
-          <Button className="primary-button" onClick={submitTask}>{editingId ? 'Save changes' : 'Add quest'} <Icon name="arrow" size={15} /></Button>
-        </section>
+        <>
+          <section className="task-composer">
+            <span className="composer-icon"><Icon name="task" /></span>
+            <label><span>{editingId ? 'Update your task' : 'What needs to be done?'}</span><input autoFocus value={newTitle} onChange={(event) => setNewTitle(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && submitTask()} placeholder="e.g. Finish chapter 5 notes" /></label>
+            <label className="due-field"><span>DUE DATE (OPTIONAL)</span><input type="date" value={newDate} onChange={(event) => setNewDate(event.target.value)} /></label>
+            {newDate && <label className="due-field"><span>DUE TIME</span><input type="time" value={newTime} onChange={(event) => setNewTime(event.target.value)} /></label>}
+            {editingId && <Button className="outline-button" onClick={() => { resetForm(); setComposerOpen(false) }}>Cancel</Button>}
+            <Button className="primary-button" onClick={submitTask} disabled={busy}>{busy ? 'Saving…' : editingId ? 'Save changes' : 'Add quest'} <Icon name="arrow" size={15} /></Button>
+          </section>
+          {newDate && (
+            <div className="composer-extra">
+              <GoogleAlertTick checked={viaGoogle} onChange={setViaGoogle} email={email} hint="(alerts you at the due time, even when UFlow is closed)" />
+            </div>
+          )}
+        </>
       )}
+      {notice && <p className="cal-notice">{notice}</p>}
 
       <section className="panel task-manager">
         <div className="task-tabs">
@@ -476,16 +605,19 @@ function TasksPage({
           ))}
         </div>
         <div className="full-task-list">
-          {visibleTasks.map((task) => (
-            <div className={`full-task-row ${task.completed ? 'done' : ''}`} key={task.id}>
-              <TaskCheck checked={task.completed} onClick={() => toggleTask(task.id)} />
-              <span className={`course-badge ${task.color}`}><Icon name="book" size={16} /></span>
-              <div><strong>{task.title}</strong><span>{task.course} · {task.time ? `Today at ${task.time}` : 'Today'}</span></div>
-              <em>+{task.points} XP</em>
-              <Button className="mini-edit-button" onClick={() => editTask(task)}>Edit</Button>
-              <Button className="icon-button delete-button" ariaLabel={`Delete ${task.title}`} onClick={() => setDeleteId(task.id)}><Icon name="trash" size={16} /></Button>
-            </div>
-          ))}
+          {visibleTasks.map((task) => {
+            const overdue = !task.completed && Boolean(task.dueAt) && (task.dueAt as number) < now
+            return (
+              <div className={`full-task-row ${task.completed ? 'done' : ''}`} key={task.id}>
+                <TaskCheck checked={task.completed} onClick={() => toggleTask(task.id)} />
+                <span className={`course-badge ${task.color}`}><Icon name="book" size={16} /></span>
+                <div><strong>{task.title}</strong><span className={overdue ? 'due-late' : ''}>{task.course} · {task.dueAt ? `${overdue ? 'Overdue · ' : 'Due '}${formatWhen(task.dueAt)}` : 'No due date'}{task.googleId ? ' · Google alert' : ''}</span></div>
+                <em>+{task.points} XP</em>
+                <Button className="mini-edit-button" onClick={() => editTask(task)}>Edit</Button>
+                <Button className="icon-button delete-button" ariaLabel={`Delete ${task.title}`} onClick={() => setDeleteId(task.id)}><Icon name="trash" size={16} /></Button>
+              </div>
+            )
+          })}
           {visibleTasks.length === 0 && <div className="empty-state"><Icon name="spark" size={28} /><strong>All clear!</strong><span>No quests in this view.</span></div>}
         </div>
       </section>
@@ -495,8 +627,8 @@ function TasksPage({
           <section className="confirm-modal">
             <span className="danger-icon"><Icon name="trash" /></span>
             <div role="heading" aria-level={2}>Delete this task?</div>
-            <p>This action cannot be undone. Your task and its reminder will be removed.</p>
-            <div><Button className="outline-button" onClick={() => setDeleteId(null)}>Cancel</Button><Button className="danger-button" onClick={() => { deleteTask(deleteId); setDeleteId(null) }}>Delete task</Button></div>
+            <p>This can’t be undone. The task and its Google Calendar alert (if it has one) will be removed.</p>
+            <div><Button className="outline-button" onClick={() => setDeleteId(null)}>Cancel</Button><Button className="danger-button" onClick={confirmDelete}>Delete task</Button></div>
           </section>
         </div>
       )}
@@ -583,7 +715,7 @@ function layoutDay(items: CalItem[], day: Date) {
   return placed
 }
 
-function CalendarPage({ uid, email }: { uid: string; email: string | null }) {
+function CalendarPage({ uid, email, launch, clearLaunch }: { uid: string; email: string | null; launch: boolean; clearLaunch: () => void }) {
   const { items: saved, add, remove } = useCollection<CalEvent>(uid, 'events')
   const [view, setView] = useState<'week' | 'month'>('week')
   const [cursor, setCursor] = useState(() => startOfDay(new Date()))
@@ -731,6 +863,13 @@ function CalendarPage({ uid, email }: { uid: string; email: string | null }) {
     setFormError('')
     setComposer({ date: dateInputValue(chosen) })
   }
+
+  useEffect(() => {
+    if (!launch) return
+    clearLaunch()
+    openComposer()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [launch])
 
   const saveEvent = async () => {
     if (!title.trim()) return setFormError('Give the event a title.')
@@ -951,47 +1090,186 @@ const googleErrorText = (error: unknown) => {
   return message
 }
 
-type ReminderApi = {
-  reminders: Reminder[]
-  add: (data: Omit<Reminder, 'id' | 'createdAt'>) => Promise<unknown>
-  update: (id: string, data: Partial<Omit<Reminder, 'id' | 'createdAt'>>) => Promise<unknown>
+/* ---------- shared helpers: days, medicine history, Google alerts ---------- */
+
+type Coll<T extends { id: string; createdAt: number }> = {
+  items: T[]
+  add: (data: Omit<T, 'id' | 'createdAt'>) => Promise<{ id: string } | void>
+  update: (id: string, data: Partial<Omit<T, 'id' | 'createdAt'>>) => Promise<unknown>
   remove: (id: string) => Promise<unknown>
 }
 
+const dayKey = (value: number | Date) => {
+  const d = new Date(value)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+const atTime = (day: string, time24: string) => new Date(`${day}T${time24}`).getTime()
+const fmtMinutes = (minutes: number) => (minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`)
+const hhmm = (timestamp: number) => new Date(timestamp).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+const FOCUS_GOAL_MIN = 180
+const ALERT_WINDOW_MS = 120000
+
+const tookOn = (medicine: Medicine, day: string) => medicine.takenOn === day || Boolean(medicine.takenDays?.includes(day))
+const dayComplete = (medicines: Medicine[], day: string) => {
+  const due = medicines.filter((medicine) => dayKey(medicine.createdAt) <= day)
+  return due.length > 0 && due.every((medicine) => tookOn(medicine, day))
+}
+/** Counts back from today (or yesterday, if today isn’t finished yet) while each day is good. */
+const countStreak = (good: (day: string) => boolean) => {
+  const cursor = new Date()
+  if (!good(dayKey(cursor))) cursor.setDate(cursor.getDate() - 1)
+  let streak = 0
+  while (streak < 400 && good(dayKey(cursor))) {
+    streak++
+    cursor.setDate(cursor.getDate() - 1)
+  }
+  return streak
+}
+
+const markMedicine = (coll: Coll<Medicine>, medicine: Medicine, taken: boolean) => {
+  const today = todayKey()
+  const days = new Set(medicine.takenDays ?? [])
+  if (medicine.takenOn) days.add(medicine.takenOn)
+  if (taken) days.add(today)
+  else days.delete(today)
+  return coll.update(medicine.id, { takenOn: taken ? today : '', takenDays: Array.from(days).slice(-120) })
+}
+
+type GoogleAlertOptions = { daily?: boolean; note?: string; icon?: string }
+
+/** Creates the Google Calendar alert for something just saved. Never throws; returns a message to show if it couldn’t. */
+async function makeGoogleAlert(title: string, at: number, options: GoogleAlertOptions): Promise<{ googleId?: string; message: string }> {
+  if (!googleConnected()) return { message: 'Saved in UFlow. Connect Google Calendar to add its phone alert.' }
+  try {
+    return { googleId: await createGoogleReminder(title, at, options), message: '' }
+  } catch (error) {
+    return { message: `Saved in UFlow, but the Google Calendar alert wasn’t created. ${googleErrorText(error)}` }
+  }
+}
+
+/** Removes a Google Calendar alert. Returns a message to show if it couldn’t. */
+async function dropGoogleAlert(googleId: string | undefined, verb = 'Removed'): Promise<string> {
+  if (!googleId) return ''
+  if (!googleConnected()) return `${verb} in UFlow. Its Google Calendar alert is still there; connect Google Calendar and delete it there if you don’t want it.`
+  try {
+    await deleteGoogleEvent(googleId)
+    return ''
+  } catch (error) {
+    return `${verb} in UFlow, but not in Google Calendar. ${googleErrorText(error)}`
+  }
+}
+
+/** The "Also alert me through Google Calendar" tick box, with a Connect button when Google isn’t connected. */
+function GoogleAlertTick({ checked, onChange, email, hint }: { checked: boolean; onChange: (value: boolean) => void; email: string | null; hint: string }) {
+  const [connecting, setConnecting] = useState(false)
+  const [error, setError] = useState('')
+  if (!googleCalendarConfigured) return null
+  const connect = async () => {
+    setConnecting(true)
+    setError('')
+    try {
+      await connectGoogle(email)
+    } catch (err) {
+      setError(googleErrorText(err))
+    }
+    setConnecting(false)
+  }
+  return (
+    <div className="reminder-google-row">
+      <label className="tick-row">
+        <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+        <span>Also alert me through Google Calendar <small>{hint}</small></span>
+      </label>
+      {checked && !googleConnected() && (
+        <Button className="sync-button" onClick={connect} disabled={connecting}><Icon name="calendar" size={16} /> {connecting ? 'Connecting…' : googleWasLinked() ? 'Reconnect Google Calendar' : 'Connect Google Calendar'}</Button>
+      )}
+      {error && <small className="tone-error">{error}</small>}
+    </div>
+  )
+}
+
+/* ---------- what is due, and the alert pop-ups ---------- */
+
+type AlertItem = { key: string; at: number; kind: 'reminder' | 'medicine' | 'task'; id: string; title: string; detail: string }
+
+/** Everything that can alert: reminders, today’s untaken medicine, and unfinished tasks with a due time. */
+function dueItems(reminders: Reminder[], medicines: Medicine[], tasks: Task[]): AlertItem[] {
+  const today = todayKey()
+  const out: AlertItem[] = []
+  for (const reminder of reminders) out.push({ key: `r:${reminder.id}`, at: reminder.remindAt, kind: 'reminder', id: reminder.id, title: reminder.title, detail: 'Reminder' })
+  for (const medicine of medicines) {
+    if (tookOn(medicine, today)) continue
+    const key = `m:${medicine.id}:${today}`
+    out.push({ key, at: getSnooze(key) ?? atTime(today, medicine.time24), kind: 'medicine', id: medicine.id, title: medicine.name, detail: medicine.detail || 'Time for your dose' })
+  }
+  for (const task of tasks) {
+    if (task.completed || !task.dueAt) continue
+    const key = `t:${task.id}:${task.dueAt}`
+    out.push({ key, at: getSnooze(key) ?? task.dueAt, kind: 'task', id: task.id, title: task.title, detail: 'Task due' })
+  }
+  return out
+}
+
+type Notice = { key: string; at: number; late: boolean; kind: AlertItem['kind']; title: string; text: string }
+
+const noticePage: Record<AlertItem['kind'], { page: Page; tone: Tone; icon: IconName }> = {
+  reminder: { page: 'reminders', tone: 'coral', icon: 'bell' },
+  medicine: { page: 'medicine', tone: 'yellow', icon: 'pill' },
+  task: { page: 'tasks', tone: 'blue', icon: 'task' },
+}
+
+/** The notification drawer: things that are late, or coming up in the next 24 hours. */
+function buildNotices(items: AlertItem[], nowMs: number): Notice[] {
+  const DAY = 86400000
+  return items
+    .filter((item) => item.at > nowMs - 3 * DAY && item.at < nowMs + DAY)
+    .map((item) => {
+      const late = item.at <= nowMs
+      const text =
+        item.kind === 'reminder' ? (late ? 'Missed reminder' : 'Coming up')
+        : item.kind === 'medicine' ? (late ? 'Dose is due and not marked as taken' : 'Dose coming up')
+        : late ? 'Task is overdue' : 'Task due soon'
+      return { key: `${item.key}@${item.at}`, at: item.at, late, kind: item.kind, title: item.title, text }
+    })
+    .sort((a, b) => (a.late === b.late ? (a.late ? b.at - a.at : a.at - b.at) : a.late ? -1 : 1))
+}
+
 /** Moves a reminder later (Snooze), keeping its Google Calendar alert in step when possible. */
-async function snoozeReminder(api: ReminderApi, reminder: Reminder, minutes = 10) {
+async function snoozeReminder(coll: Coll<Reminder>, reminder: Reminder, minutes = 10) {
   const remindAt = Math.max(Date.now(), reminder.remindAt) + minutes * 60000
-  await api.update(reminder.id, { remindAt })
+  await coll.update(reminder.id, { remindAt })
   if (reminder.googleId && googleConnected()) {
     try {
-      await moveGoogleReminder(reminder.googleId, remindAt)
+      await updateGoogleReminder(reminder.googleId, { at: remindAt })
     } catch {
       /* the UFlow alert still moves; the Google one can be fixed in Google Calendar */
     }
   }
 }
 
-/** Watches reminders on every page. Rings and pops up when one is due (only ones due within the last 2 minutes). */
-function ReminderAlerts({ api }: { api: ReminderApi }) {
-  const [ringing, setRinging] = useState<Reminder[]>([])
-  const latest = useRef(api.reminders)
-  latest.current = api.reminders
+type AlertData = { reminders: Coll<Reminder>; medicines: Coll<Medicine>; tasks: Coll<Task>; toggleTask: (id: string) => void }
+
+/** Watches everything on every page. Rings and pops up when something is due (only things due within the last 2 minutes). */
+function AlertCenter({ data }: { data: AlertData }) {
+  const [ringing, setRinging] = useState<AlertItem[]>([])
+  const latest = useRef(data)
+  latest.current = data
 
   useEffect(() => unlockAudioOnFirstTouch(), [])
 
   useEffect(() => {
     const check = () => {
-      const prefs = getPrefs()
-      const due = latest.current.filter((reminder) => {
-        const late = Date.now() - reminder.remindAt
-        return late >= 0 && late < 120000 && !wasFired(`${reminder.id}@${reminder.remindAt}`)
+      const { reminders, medicines, tasks } = latest.current
+      const due = dueItems(reminders.items, medicines.items, tasks.items).filter((item) => {
+        const late = Date.now() - item.at
+        return late >= 0 && late < ALERT_WINDOW_MS && !wasFired(`${item.key}@${item.at}`)
       })
       if (due.length === 0) return
-      due.forEach((reminder) => markFired(`${reminder.id}@${reminder.remindAt}`))
-      if (!prefs.uflow) return
-      setRinging((current) => [...current, ...due.filter((reminder) => !current.some((item) => item.id === reminder.id))])
+      due.forEach((item) => markFired(`${item.key}@${item.at}`))
+      if (!getPrefs().uflow) return
+      setRinging((current) => [...current, ...due.filter((item) => !current.some((other) => other.key === item.key))])
       startRingtone()
-      due.forEach((reminder) => showDesktopNotification('UFlow reminder', reminder.title))
+      due.forEach((item) => showDesktopNotification(item.kind === 'medicine' ? 'Time for your medicine' : item.kind === 'task' ? 'Task due' : 'UFlow reminder', item.title))
     }
     check()
     const timer = window.setInterval(check, 5000)
@@ -1002,20 +1280,42 @@ function ReminderAlerts({ api }: { api: ReminderApi }) {
     if (ringing.length === 0) stopRingtone()
   }, [ringing.length])
 
-  const close = (id: string) => setRinging((current) => current.filter((item) => item.id !== id))
+  const close = (key: string) => setRinging((current) => current.filter((item) => item.key !== key))
+
+  const snooze = (item: AlertItem) => {
+    if (item.kind === 'reminder') {
+      const reminder = latest.current.reminders.items.find((entry) => entry.id === item.id)
+      if (reminder) void snoozeReminder(latest.current.reminders, reminder)
+    } else {
+      setSnooze(item.key, Date.now() + 10 * 60000)
+    }
+    close(item.key)
+  }
+
+  const finish = (item: AlertItem) => {
+    if (item.kind === 'medicine') {
+      const medicine = latest.current.medicines.items.find((entry) => entry.id === item.id)
+      if (medicine) void markMedicine(latest.current.medicines, medicine, true)
+    } else if (item.kind === 'task') {
+      latest.current.toggleTask(item.id)
+    }
+    close(item.key)
+  }
 
   if (ringing.length === 0) return null
   return (
     <div className="alert-stack" role="alert">
-      {ringing.map((reminder) => (
-        <div className="alert-toast" key={reminder.id}>
-          <span className="alert-toast-icon"><Icon name="bell" size={18} /></span>
+      {ringing.map((item) => (
+        <div className="alert-toast" key={item.key}>
+          <span className="alert-toast-icon"><Icon name={noticePage[item.kind].icon} size={18} /></span>
           <div>
-            <small>REMINDER</small>
-            <strong>{reminder.title}</strong>
+            <small>{item.kind === 'medicine' ? 'MEDICINE TIME' : item.kind === 'task' ? 'TASK DUE' : 'REMINDER'}</small>
+            <strong>{item.title}</strong>
+            {item.kind === 'medicine' && <p>{item.detail}</p>}
             <div className="alert-toast-actions">
-              <Button className="light-button" onClick={() => { void snoozeReminder(api, reminder); close(reminder.id) }}>Snooze 10 min</Button>
-              <Button className="primary-button" onClick={() => close(reminder.id)}>Got it</Button>
+              {item.kind !== 'reminder' && <Button className="primary-button" onClick={() => finish(item)}>{item.kind === 'medicine' ? 'Mark as taken' : 'Mark done'}</Button>}
+              <Button className="light-button" onClick={() => snooze(item)}>Snooze 10 min</Button>
+              <Button className={item.kind === 'reminder' ? 'primary-button' : 'text-button'} onClick={() => close(item.key)}>{item.kind === 'reminder' ? 'Got it' : 'Dismiss'}</Button>
             </div>
           </div>
         </div>
@@ -1024,8 +1324,8 @@ function ReminderAlerts({ api }: { api: ReminderApi }) {
   )
 }
 
-function RemindersPage({ api, email }: { api: ReminderApi; email: string | null }) {
-  const { reminders, add, update, remove } = api
+function RemindersPage({ coll, email, launch, clearLaunch }: { coll: Coll<Reminder>; email: string | null; launch: boolean; clearLaunch: () => void }) {
+  const { items: reminders, add, update, remove } = coll
   const [composerOpen, setComposerOpen] = useState(false)
   const [title, setTitle] = useState('')
   const [date, setDate] = useState(todayKey())
@@ -1035,7 +1335,6 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
   const [viaGoogle, setViaGoogle] = useState(prefs.google)
   const [permission, setPermission] = useState(desktopPermission())
   const [notice, setNotice] = useState('')
-  const [connecting, setConnecting] = useState(false)
   const [busy, setBusy] = useState(false)
   const [toneError, setToneError] = useState('')
   const toneFile = useRef<HTMLInputElement>(null)
@@ -1044,6 +1343,13 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
     const timer = window.setInterval(() => setNow(Date.now()), 30000)
     return () => window.clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    if (!launch) return
+    clearLaunch()
+    setViaGoogle(getPrefs().google)
+    setComposerOpen(true)
+  }, [launch, clearLaunch])
 
   const changePrefs = (patch: Partial<AlertPrefs>) => {
     const next = { ...prefs, ...patch }
@@ -1056,17 +1362,6 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
   const googleReady = googleConnected()
   const pending = reminders.filter((reminder) => reminder.viaGoogle && !reminder.googleId && reminder.remindAt > now)
 
-  const connect = async () => {
-    setConnecting(true)
-    setNotice('')
-    try {
-      await connectGoogle(email)
-    } catch (error) {
-      setNotice(googleErrorText(error))
-    }
-    setConnecting(false)
-  }
-
   const addReminder = async () => {
     if (!title.trim() || !date || !time || busy) return
     setBusy(true)
@@ -1075,15 +1370,9 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
     let message = ''
     if (viaGoogle) {
       data.viaGoogle = true
-      if (googleConnected()) {
-        try {
-          data.googleId = await createGoogleReminder(data.title, remindAt)
-        } catch (error) {
-          message = `Saved in UFlow, but the Google Calendar alert wasn’t created. ${googleErrorText(error)}`
-        }
-      } else {
-        message = 'Saved in UFlow. Connect Google Calendar to add its phone alert.'
-      }
+      const result = await makeGoogleAlert(data.title, remindAt, { icon: '🔔', note: 'Reminder from UFlow' })
+      if (result.googleId) data.googleId = result.googleId
+      message = result.message
     }
     await add(data)
     setNotice(message)
@@ -1097,7 +1386,7 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
     let failure = ''
     for (const reminder of pending) {
       try {
-        const googleId = await createGoogleReminder(reminder.title, reminder.remindAt)
+        const googleId = await createGoogleReminder(reminder.title, reminder.remindAt, { icon: '🔔', note: 'Reminder from UFlow' })
         await update(reminder.id, { googleId })
       } catch (error) {
         failure = googleErrorText(error)
@@ -1109,19 +1398,7 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
   }
 
   const removeReminder = async (reminder: Reminder) => {
-    let message = ''
-    if (reminder.googleId) {
-      if (googleConnected()) {
-        try {
-          await deleteGoogleEvent(reminder.googleId)
-        } catch (error) {
-          message = `Deleted in UFlow, but not in Google Calendar. ${googleErrorText(error)}`
-        }
-      } else {
-        message = 'Deleted in UFlow. Its Google Calendar alert is still there; connect Google Calendar and delete it there if you don’t want it.'
-      }
-    }
-    setNotice(message)
+    setNotice(await dropGoogleAlert(reminder.googleId, 'Deleted'))
     await remove(reminder.id)
   }
 
@@ -1164,17 +1441,7 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
           <label><span>DATE</span><input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label>
           <label><span>TIME</span><input type="time" value={time} onChange={(event) => setTime(event.target.value)} /></label>
           <Button className="primary-button" onClick={addReminder} disabled={busy}>{busy ? 'Saving…' : 'Save reminder'}</Button>
-          {googleCalendarConfigured && (
-            <div className="reminder-google-row">
-              <label className="tick-row">
-                <input type="checkbox" checked={viaGoogle} onChange={(event) => setViaGoogle(event.target.checked)} />
-                <span>Also alert me through Google Calendar <small>(rings on your phone even when UFlow is closed)</small></span>
-              </label>
-              {viaGoogle && !googleReady && (
-                <Button className="sync-button" onClick={connect} disabled={connecting}><Icon name="calendar" size={16} /> {connecting ? 'Connecting…' : googleWasLinked() ? 'Reconnect Google Calendar' : 'Connect Google Calendar'}</Button>
-              )}
-            </div>
-          )}
+          <GoogleAlertTick checked={viaGoogle} onChange={setViaGoogle} email={email} hint="(rings on your phone even when UFlow is closed)" />
         </section>
       )}
       {notice && <p className="cal-notice">{notice}</p>}
@@ -1186,7 +1453,7 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
       )}
       <section className="reminder-summary">
         <div><span className="summary-icon"><Icon name="bell" /></span><span><small>NEXT REMINDER</small><strong>{next ? next.title : 'Nothing scheduled'}</strong><p>{next ? timeUntil(next.remindAt, now) : 'Add a reminder to stay on track.'}</p></span></div>
-        {next && <Button className="light-button" onClick={() => snoozeReminder(api, next)}>Snooze for 10 min</Button>}
+        {next && <Button className="light-button" onClick={() => snoozeReminder(coll, next)}>Snooze for 10 min</Button>}
       </section>
       <section className="reminder-layout">
         <article className="panel reminder-list">
@@ -1210,8 +1477,8 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
         <aside className="panel reminder-settings">
           <span>NOTIFICATION SETTINGS</span>
           <strong>Stay in control.</strong>
-          <label><span><b>UFlow pop-up and ringtone</b><small>Needs UFlow open in a tab</small></span><input type="checkbox" checked={prefs.uflow} onChange={(event) => changePrefs({ uflow: event.target.checked })} /></label>
-          <label><span><b>Google Calendar alerts</b><small>{googleCalendarConfigured ? 'Ticked by default for new reminders' : 'Add your Google client ID first'}</small></span><input type="checkbox" checked={prefs.google} disabled={!googleCalendarConfigured} onChange={(event) => changePrefs({ google: event.target.checked })} /></label>
+          <label><span><b>UFlow pop-up and ringtone</b><small>Reminders, medicine, tasks and focus. Needs UFlow open in a tab</small></span><input type="checkbox" checked={prefs.uflow} onChange={(event) => changePrefs({ uflow: event.target.checked })} /></label>
+          <label><span><b>Google Calendar alerts</b><small>{googleCalendarConfigured ? 'Ticked by default for new reminders, tasks and medicine' : 'Add your Google client ID first'}</small></span><input type="checkbox" checked={prefs.google} disabled={!googleCalendarConfigured} onChange={(event) => changePrefs({ google: event.target.checked })} /></label>
           <label><span><b>Vibration</b><small>{vibrationSupported() ? 'Buzz along with the ringtone' : 'Not available on this device (Android phones only)'}</small></span><input type="checkbox" checked={prefs.vibrate} disabled={!vibrationSupported()} onChange={(event) => { changePrefs({ vibrate: event.target.checked }); if (event.target.checked) playTestTone({ vibrate: true }) }} /></label>
           <div className="tone-picker">
             <span>RINGTONE</span>
@@ -1240,7 +1507,7 @@ function RemindersPage({ api, email }: { api: ReminderApi; email: string | null 
   )
 }
 
-function NotesPage({ uid }: { uid: string }) {
+function NotesPage({ uid, launch, clearLaunch }: { uid: string; launch: boolean; clearLaunch: () => void }) {
   const { items: notes, add, update, remove } = useCollection<Note>(uid, 'notes', true)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState({ title: '', body: '' })
@@ -1266,6 +1533,13 @@ function NotesPage({ uid }: { uid: string }) {
       setEditingId(created.id)
     }
   }
+
+  useEffect(() => {
+    if (!launch) return
+    clearLaunch()
+    void addNote()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [launch])
 
   const openEditor = (note: Note) => {
     setDraft({ title: note.title, body: note.body })
@@ -1395,34 +1669,93 @@ function NotesPage({ uid }: { uid: string }) {
   )
 }
 
-function FocusPage({ name }: { name: string }) {
+/** The focus timer lives in the workspace so it keeps running (and rings) on every page. */
+function useFocusTimer(onComplete: (minutes: number) => void, name: string) {
   const [duration, setDuration] = useState(25)
   const [seconds, setSeconds] = useState(25 * 60)
   const [running, setRunning] = useState(false)
-  const [completed, setCompleted] = useState(false)
+  const [doneMinutes, setDoneMinutes] = useState<number | null>(null)
+  const endAt = useRef(0)
+  const callback = useRef(onComplete)
+  callback.current = onComplete
 
-  useEffect(() => {
-    if (!running || seconds <= 0) return
-    const timer = window.setInterval(() => setSeconds((value) => value - 1), 1000)
-    return () => window.clearInterval(timer)
-  }, [running, seconds])
-
-  useEffect(() => {
-    if (seconds === 0 && running) {
-      setRunning(false)
-      setCompleted(true)
+  const finish = (minutes: number) => {
+    endAt.current = 0
+    setRunning(false)
+    setSeconds(duration * 60)
+    setDoneMinutes(minutes)
+    callback.current(minutes)
+    if (getPrefs().uflow) {
+      startRingtone(10)
+      showDesktopNotification('Focus session complete', `Great work, ${name}.`)
     }
-  }, [seconds, running])
+  }
+  const finishRef = useRef(finish)
+  finishRef.current = finish
 
-  const chooseDuration = (minutes: number) => {
+  useEffect(() => {
+    if (!running) return
+    // Counts against the clock, so it stays accurate even when the tab is in the background.
+    const tick = () => {
+      if (!endAt.current) return
+      const left = Math.max(0, Math.ceil((endAt.current - Date.now()) / 1000))
+      setSeconds(left)
+      if (left === 0) finishRef.current(duration)
+    }
+    const timer = window.setInterval(tick, 250)
+    return () => window.clearInterval(timer)
+  }, [running, duration])
+
+  const choose = (minutes: number) => {
+    endAt.current = 0
     setDuration(minutes)
     setSeconds(minutes * 60)
     setRunning(false)
-    setCompleted(false)
   }
+  const toggle = () => {
+    if (running) {
+      setRunning(false)
+    } else {
+      endAt.current = Date.now() + seconds * 1000
+      setRunning(true)
+    }
+  }
+  const reset = () => {
+    endAt.current = 0
+    setRunning(false)
+    setSeconds(duration * 60)
+  }
+  // Ends the session now and counts the whole minutes already focused (under one minute isn’t counted).
+  const finishEarly = () => {
+    const elapsed = duration * 60 - seconds
+    if (elapsed >= 60) finish(Math.floor(elapsed / 60))
+    else reset()
+  }
+  const dismiss = () => {
+    stopRingtone()
+    setDoneMinutes(null)
+  }
+  return { duration, seconds, running, doneMinutes, choose, toggle, reset, finishEarly, dismiss }
+}
+
+type FocusTimer = ReturnType<typeof useFocusTimer>
+
+function FocusPage({ name, timer, sessions }: { name: string; timer: FocusTimer; sessions: FocusSession[] }) {
+  const { duration, seconds, running } = timer
   const minutes = Math.floor(seconds / 60).toString().padStart(2, '0')
   const remainingSeconds = (seconds % 60).toString().padStart(2, '0')
   const progress = ((duration * 60 - seconds) / (duration * 60)) * 100
+
+  const today = todayKey()
+  const todayMin = sessions.filter((session) => session.day === today).reduce((sum, session) => sum + session.minutes, 0)
+  const monday = mondayOf(new Date())
+  const week = Array.from({ length: 7 }, (_, index) => {
+    const key = dayKey(addDays(monday, index))
+    return { key, minutes: sessions.filter((session) => session.day === key).reduce((sum, session) => sum + session.minutes, 0) }
+  })
+  const weekTotal = week.reduce((sum, day) => sum + day.minutes, 0)
+  const tallest = Math.max(60, ...week.map((day) => day.minutes))
+  const left = FOCUS_GOAL_MIN - todayMin
 
   return (
     <>
@@ -1430,67 +1763,151 @@ function FocusPage({ name }: { name: string }) {
       <section className="focus-layout">
         <article className="focus-studio">
           <div className="focus-modes">
-            {[25, 50, 15].map((minutes) => <Button className={duration === minutes ? 'active' : ''} key={minutes} onClick={() => chooseDuration(minutes)}>{minutes === 25 ? 'Focus' : minutes === 50 ? 'Deep work' : 'Quick sprint'}<span>{minutes}m</span></Button>)}
+            {[25, 50, 15].map((option) => <Button className={duration === option ? 'active' : ''} key={option} onClick={() => timer.choose(option)}>{option === 25 ? 'Focus' : option === 50 ? 'Deep work' : 'Quick sprint'}<span>{option}m</span></Button>)}
           </div>
           <div className="timer-wrap" style={{ '--timer-progress': `${progress * 3.6}deg` } as React.CSSProperties}>
             <div className="timer-face"><span>TIME TO FOCUS</span><strong>{minutes}:{remainingSeconds}</strong><small>{running ? `You’ve got this, ${name}.` : 'Select play when you’re ready.'}</small></div>
           </div>
           <div className="timer-actions">
-            <Button className="secondary-round" ariaLabel="Reset timer" onClick={() => { setRunning(false); setSeconds(duration * 60) }}><Icon name="clock" /></Button>
-            <Button className="timer-play" onClick={() => setRunning(!running)}><Icon name={running ? 'pause' : 'play'} size={22} /> {running ? 'Pause' : 'Start focus'}</Button>
-            <Button className="secondary-round" ariaLabel="Skip timer" onClick={() => setSeconds(0)}><Icon name="arrow" /></Button>
+            <Button className="secondary-round" ariaLabel="Reset timer" onClick={timer.reset}><Icon name="clock" /></Button>
+            <Button className="timer-play" onClick={timer.toggle}><Icon name={running ? 'pause' : 'play'} size={22} /> {running ? 'Pause' : 'Start focus'}</Button>
+            <Button className="secondary-round" ariaLabel="Finish early and save the time so far" onClick={timer.finishEarly}><Icon name="arrow" /></Button>
           </div>
         </article>
         <aside className="focus-side">
           <article className="focus-goal">
-            <span><Icon name="spark" /></span><small>TODAY’S GOAL</small><strong>2h 35m</strong><p>of 3 hours focused</p><ProgressBar value={86} color="blue" /><em>25 minutes to go</em>
+            <span><Icon name="spark" /></span><small>TODAY’S GOAL</small><strong>{fmtMinutes(todayMin)}</strong><p>of {FOCUS_GOAL_MIN / 60} hours focused</p><ProgressBar value={Math.min(100, pct(todayMin, FOCUS_GOAL_MIN))} color="blue" /><em>{left > 0 ? `${fmtMinutes(left)} to go` : 'Goal reached. Great work!'}</em>
           </article>
           <article className="focus-history panel">
             <span>THIS WEEK</span><strong>Focus rhythm</strong>
-            <div className="bar-chart">{[58, 82, 45, 95, 68, 28, 12].map((height, index) => <i key={index} style={{ height: `${height}%` }}><small>{['M', 'T', 'W', 'T', 'F', 'S', 'S'][index]}</small></i>)}</div>
-            <p><b>8h 20m</b><span>Total focused this week</span></p>
+            <div className="bar-chart">{week.map((day, index) => <i className={day.key === today ? 'today' : ''} key={day.key} title={fmtMinutes(day.minutes)} style={{ height: `${Math.max(5, Math.round((day.minutes / tallest) * 100))}%` }}><small>{['M', 'T', 'W', 'T', 'F', 'S', 'S'][index]}</small></i>)}</div>
+            <p><b>{fmtMinutes(weekTotal)}</b><span>Total focused this week</span></p>
           </article>
         </aside>
       </section>
-      {completed && (
-        <div className="completion-toast">
-          <span><Icon name="spark" /></span>
-          <div><strong>Focus session complete!</strong><p>Great work, {name}. Take a short break before your next session.</p></div>
-          <Button className="icon-button" onClick={() => setCompleted(false)} ariaLabel="Dismiss completion message"><Icon name="plus" /></Button>
-        </div>
-      )}
     </>
   )
 }
 
-function MedicinePage({ uid }: { uid: string }) {
-  const { items, add, update } = useCollection<Medicine>(uid, 'medicines')
+function MedicinePage({ coll, email, launch, clearLaunch }: { coll: Coll<Medicine>; email: string | null; launch: boolean; clearLaunch: () => void }) {
+  const { items } = coll
   const medicines = [...items].sort((a, b) => a.time24.localeCompare(b.time24))
   const today = todayKey()
   const [composerOpen, setComposerOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [managing, setManaging] = useState(false)
+  const [confirmId, setConfirmId] = useState<string | null>(null)
   const [medicineName, setMedicineName] = useState('')
   const [dosage, setDosage] = useState('1 tablet')
   const [time24, setTime24] = useState('09:00')
   const [instructions, setInstructions] = useState('With food')
-  const takenCount = medicines.filter((medicine) => medicine.takenOn === today).length
-  const toggleTaken = (medicine: Medicine) => update(medicine.id, { takenOn: medicine.takenOn === today ? '' : today })
-  const addMedicine = () => {
-    if (!medicineName.trim() || !time24) return
-    add({
-      name: medicineName.trim(),
-      detail: [dosage.trim(), instructions.trim()].filter(Boolean).join(' · '),
-      time24,
-      color: tones[items.length % tones.length],
-      takenOn: '',
-    })
+  const [viaGoogle, setViaGoogle] = useState(getPrefs().google)
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const takenCount = medicines.filter((medicine) => tookOn(medicine, today)).length
+
+  const resetForm = () => {
+    setEditingId(null)
     setMedicineName('')
+    setDosage('1 tablet')
+    setTime24('09:00')
+    setInstructions('With food')
+    setViaGoogle(getPrefs().google)
+  }
+
+  useEffect(() => {
+    if (!launch) return
+    clearLaunch()
+    resetForm()
+    setComposerOpen(true)
+  }, [launch, clearLaunch])
+
+  const toggleTaken = (medicine: Medicine) => markMedicine(coll, medicine, !tookOn(medicine, today))
+
+  const saveMedicine = async () => {
+    const title = medicineName.trim()
+    if (!title || !time24 || busy) return
+    setBusy(true)
+    const detail = [dosage.trim(), instructions.trim()].filter(Boolean).join(' · ')
+    const options = { daily: true, icon: '💊', note: detail ? `${detail} (daily, from UFlow)` : 'Daily medicine, from UFlow' }
+    let message = ''
+    if (editingId) {
+      const existing = items.find((item) => item.id === editingId)
+      const patch: Partial<Omit<Medicine, 'id' | 'createdAt'>> = { name: title, detail, time24, viaGoogle }
+      if (existing?.googleId) {
+        if (!googleConnected()) {
+          message = 'Saved in UFlow, but its Google Calendar alert wasn’t updated because Google isn’t connected.'
+        } else {
+          try {
+            if (viaGoogle) {
+              await updateGoogleReminder(existing.googleId, { title, icon: '💊', at: atTime(today, time24), note: options.note })
+            } else {
+              await deleteGoogleEvent(existing.googleId)
+              patch.googleId = ''
+            }
+          } catch (error) {
+            message = `Saved in UFlow, but Google Calendar wasn’t updated. ${googleErrorText(error)}`
+          }
+        }
+      } else if (viaGoogle) {
+        const result = await makeGoogleAlert(title, atTime(today, time24), options)
+        if (result.googleId) patch.googleId = result.googleId
+        message = result.message
+      }
+      await coll.update(editingId, patch)
+    } else {
+      const data: Omit<Medicine, 'id' | 'createdAt'> = { name: title, detail, time24, color: tones[items.length % tones.length], takenOn: '', takenDays: [] }
+      if (viaGoogle) {
+        data.viaGoogle = true
+        const result = await makeGoogleAlert(title, atTime(today, time24), options)
+        if (result.googleId) data.googleId = result.googleId
+        message = result.message
+      }
+      await coll.add(data)
+    }
+    setNotice(message)
+    resetForm()
+    setBusy(false)
     setComposerOpen(false)
   }
+
+  const editMedicine = (medicine: Medicine) => {
+    const [first, ...rest] = medicine.detail.split(' · ')
+    setEditingId(medicine.id)
+    setMedicineName(medicine.name)
+    setDosage(first ?? '')
+    setInstructions(rest.join(' · '))
+    setTime24(medicine.time24)
+    setViaGoogle(Boolean(medicine.googleId) || (medicine.viaGoogle ?? getPrefs().google))
+    setComposerOpen(true)
+  }
+
+  const deleteMedicine = async (medicine: Medicine) => {
+    if (confirmId !== medicine.id) {
+      setConfirmId(medicine.id)
+      return
+    }
+    setConfirmId(null)
+    setNotice(await dropGoogleAlert(medicine.googleId, 'Deleted'))
+    await coll.remove(medicine.id)
+  }
+
+  // This week, Monday to Sunday, from what you actually marked as taken.
+  const monday = mondayOf(new Date())
+  const week = ['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((letter, index) => {
+    const day = addDays(monday, index)
+    const key = dayKey(day)
+    const scheduled = medicines.some((medicine) => dayKey(medicine.createdAt) <= key)
+    const state = key > today || !scheduled ? 'idle' : dayComplete(medicines, key) ? 'complete' : key === today ? 'current' : 'missed'
+    return { letter, key, state }
+  })
+  const streak = countStreak((day) => dayComplete(medicines, day))
+
   return (
     <>
       <div className="heading-with-action">
         <PageHeading page="medicine" />
-        <Button className="primary-button" onClick={() => setComposerOpen(!composerOpen)}><Icon name="plus" size={17} /> Add medicine</Button>
+        <Button className="primary-button" onClick={() => { resetForm(); setComposerOpen(!composerOpen || editingId !== null) }}><Icon name="plus" size={17} /> Add medicine</Button>
       </div>
       {composerOpen && (
         <section className="medicine-composer panel">
@@ -1498,9 +1915,11 @@ function MedicinePage({ uid }: { uid: string }) {
           <label><span>DOSAGE</span><input value={dosage} onChange={(event) => setDosage(event.target.value)} /></label>
           <label><span>SCHEDULE TIME</span><input type="time" value={time24} onChange={(event) => setTime24(event.target.value)} /></label>
           <label><span>INSTRUCTIONS</span><input value={instructions} onChange={(event) => setInstructions(event.target.value)} /></label>
-          <Button className="primary-button" onClick={addMedicine}>Save schedule</Button>
+          <Button className="primary-button" onClick={saveMedicine} disabled={busy}>{busy ? 'Saving…' : editingId ? 'Save changes' : 'Save schedule'}</Button>
+          <GoogleAlertTick checked={viaGoogle} onChange={setViaGoogle} email={email} hint="(repeats every day on your phone, even when UFlow is closed)" />
         </section>
       )}
+      {notice && <p className="cal-notice">{notice}</p>}
       <section className="health-summary">
         <div><span className="health-icon"><Icon name="heart" /></span><span><small>TODAY’S ROUTINE</small><strong>{takenCount} of {medicines.length} doses taken</strong></span></div>
         <span className="adherence"><b>{Math.round(pct(takenCount, medicines.length))}%</b><small>taken today</small></span>
@@ -1509,12 +1928,19 @@ function MedicinePage({ uid }: { uid: string }) {
         <div className="medicine-list">
           {medicines.length === 0 && <div className="empty-state"><Icon name="pill" size={28} /><strong>No medicines yet</strong><span>Tap “Add medicine” to set up your routine.</span></div>}
           {medicines.map((medicine) => {
-            const isTaken = medicine.takenOn === today
+            const isTaken = tookOn(medicine, today)
             return (
               <article className={`medicine-card ${isTaken ? 'taken' : ''}`} key={medicine.id}>
                 <span className={`medicine-icon ${medicine.color}`}><Icon name="pill" /></span>
-                <div><span>{formatTime(medicine.time24)}</span><strong>{medicine.name}</strong><p>{medicine.detail}</p></div>
-                <Button className={isTaken ? 'taken-button' : 'outline-button'} onClick={() => toggleTaken(medicine)}>{isTaken && <Icon name="check" size={15} />}{isTaken ? 'Taken' : 'Mark as taken'}</Button>
+                <div><span>{formatTime(medicine.time24)}</span><strong>{medicine.name}</strong><p>{medicine.detail}{medicine.googleId ? ' · Google alert on' : ''}</p></div>
+                {managing ? (
+                  <div className="medicine-manage">
+                    <Button className="mini-edit-button" onClick={() => editMedicine(medicine)}>Edit</Button>
+                    <Button className={confirmId === medicine.id ? 'danger-button' : 'icon-button delete-button'} ariaLabel={`Delete ${medicine.name}`} onClick={() => deleteMedicine(medicine)}>{confirmId === medicine.id ? 'Confirm delete' : <Icon name="trash" size={15} />}</Button>
+                  </div>
+                ) : (
+                  <Button className={isTaken ? 'taken-button' : 'outline-button'} onClick={() => toggleTaken(medicine)}>{isTaken && <Icon name="check" size={15} />}{isTaken ? 'Taken' : 'Mark as taken'}</Button>
+                )}
               </article>
             )
           })}
@@ -1522,10 +1948,10 @@ function MedicinePage({ uid }: { uid: string }) {
         <aside className="panel routine-card">
           <span>WEEKLY ROUTINE</span><strong>Consistency is care.</strong>
           <div className="routine-days">
-            {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((day, index) => <i className={index < 5 ? 'complete' : index === 5 ? 'current' : ''} key={`${day}-${index}`}><b>{day}</b><span>{index < 5 && <Icon name="check" size={12} />}</span></i>)}
+            {week.map((day, index) => <i className={day.state} key={`${day.letter}-${index}`}><b>{day.letter}</b><span>{day.state === 'complete' && <Icon name="check" size={12} />}</span></i>)}
           </div>
-          <p><Icon name="spark" size={16} /> You’re on a 5-day care streak!</p>
-          <Button className="outline-button full-button">Manage schedule <Icon name="arrow" size={14} /></Button>
+          <p><Icon name="spark" size={16} /> {medicines.length === 0 ? 'Add a medicine to start tracking.' : streak > 0 ? `You’re on a ${streak}-day care streak!` : 'Take every dose today to start a streak.'}</p>
+          <Button className="outline-button full-button" onClick={() => { setManaging(!managing); setConfirmId(null) }}>{managing ? 'Done managing' : 'Manage schedule'} <Icon name="arrow" size={14} /></Button>
         </aside>
       </section>
     </>
@@ -1652,40 +2078,127 @@ function SetupNeeded() {
   )
 }
 
-function Workspace({ user }: { user: User }) {
-  const [page, setPage] = useState<Page>('dashboard')
-  const { items: tasks, add: addTaskDoc, update: updateTaskDoc, remove: deleteTask } = useCollection<Task>(user.uid, 'tasks')
-  const { items: reminders, add: addReminderDoc, update: updateReminderDoc, remove: removeReminderDoc } = useCollection<Reminder>(user.uid, 'reminders')
-  const reminderApi: ReminderApi = { reminders, add: addReminderDoc, update: updateReminderDoc, remove: removeReminderDoc }
-  const [notificationsOpen, setNotificationsOpen] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [syncError, setSyncError] = useState(false)
-  const name = firstName(user)
-  const displayName = user.displayName || user.email?.split('@')[0] || 'Student'
-  const completedTasks = tasks.filter((task) => task.completed)
-  const xp = completedTasks.reduce((sum, task) => sum + task.points, 0)
-  const level = Math.floor(xp / 200) + 1
+type SearchData = { tasks: Task[]; notes: Note[]; reminders: Reminder[]; medicines: Medicine[]; events: CalEvent[] }
+
+function GlobalSearch({ data, go }: { data: SearchData; go: (page: Page) => void }) {
+  const [query, setQuery] = useState('')
+  const [focused, setFocused] = useState(false)
+  const input = useRef<HTMLInputElement>(null)
+  const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform)
 
   useEffect(() => {
-    let timer: number | undefined
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        input.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const q = query.trim().toLowerCase()
+  const results: { key: string; label: string; title: string; sub: string; page: Page }[] = []
+  if (q) {
+    const has = (text: string) => text.toLowerCase().includes(q)
+    data.tasks.filter((item) => has(item.title)).forEach((item) => results.push({ key: `t${item.id}`, label: 'Task', title: item.title, sub: item.completed ? 'Completed' : item.dueAt ? `Due ${formatWhen(item.dueAt)}` : 'No due date', page: 'tasks' }))
+    data.reminders.filter((item) => has(item.title)).forEach((item) => results.push({ key: `r${item.id}`, label: 'Reminder', title: item.title, sub: formatWhen(item.remindAt), page: 'reminders' }))
+    data.events.filter((item) => has(item.title) || has(item.location)).forEach((item) => results.push({ key: `e${item.id}`, label: 'Event', title: item.title, sub: formatWhen(item.start), page: 'calendar' }))
+    data.medicines.filter((item) => has(item.name)).forEach((item) => results.push({ key: `m${item.id}`, label: 'Medicine', title: item.name, sub: formatTime(item.time24), page: 'medicine' }))
+    data.notes.filter((item) => has(item.title) || has(item.body)).forEach((item) => results.push({ key: `n${item.id}`, label: 'Note', title: item.title || 'Untitled note', sub: item.body.slice(0, 60), page: 'notes' }))
+  }
+
+  const open = (page: Page) => {
+    go(page)
+    setQuery('')
+    input.current?.blur()
+  }
+
+  return (
+    <div className="global-search-wrap">
+      <label className="global-search">
+        <Icon name="search" size={17} />
+        <input
+          ref={input}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onFocus={() => setFocused(true)}
+          onBlur={() => window.setTimeout(() => setFocused(false), 120)}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') { setQuery(''); input.current?.blur() }
+            if (event.key === 'Enter' && results[0]) open(results[0].page)
+          }}
+          placeholder="Search tasks, notes, events..."
+        />
+        <kbd>{isMac ? '⌘ K' : 'Ctrl K'}</kbd>
+      </label>
+      {focused && q && (
+        <div className="search-results" role="listbox">
+          {results.slice(0, 8).map((result) => (
+            <button className="search-result" key={result.key} type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => open(result.page)}>
+              <em>{result.label}</em>
+              <span><b>{result.title}</b>{result.sub && <small>{result.sub}</small>}</span>
+            </button>
+          ))}
+          {results.length === 0 && <p className="search-empty">Nothing found for “{query.trim()}”.</p>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Workspace({ user }: { user: User }) {
+  const [page, setPage] = useState<Page>('dashboard')
+  const tasks = useCollection<Task>(user.uid, 'tasks')
+  const reminders = useCollection<Reminder>(user.uid, 'reminders')
+  const medicines = useCollection<Medicine>(user.uid, 'medicines')
+  const events = useCollection<CalEvent>(user.uid, 'events')
+  const notes = useCollection<Note>(user.uid, 'notes', true)
+  const focus = useCollection<FocusSession>(user.uid, 'focus')
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [addOpen, setAddOpen] = useState(false)
+  const [launch, setLaunch] = useState<Page | null>(null)
+  const [syncError, setSyncError] = useState(false)
+  const [now, setNow] = useState(Date.now())
+  const [seen, setSeen] = useState<string[]>(getSeen)
+  const name = firstName(user)
+  const displayName = user.displayName || user.email?.split('@')[0] || 'Student'
+  const taskList = tasks.items
+  const completedTasks = taskList.filter((task) => task.completed)
+  const xp = completedTasks.reduce((sum, task) => sum + task.points, 0)
+  const level = Math.floor(xp / 200) + 1
+  const timer = useFocusTimer((minutes) => { void focus.add({ minutes, day: todayKey() }) }, name)
+
+  useEffect(() => {
+    let errorTimer: number | undefined
     const onError = () => {
       setSyncError(true)
-      window.clearTimeout(timer)
-      timer = window.setTimeout(() => setSyncError(false), 8000)
+      window.clearTimeout(errorTimer)
+      errorTimer = window.setTimeout(() => setSyncError(false), 8000)
     }
     window.addEventListener(SYNC_ERROR_EVENT, onError)
+    const clock = window.setInterval(() => setNow(Date.now()), 30000)
     return () => {
       window.removeEventListener(SYNC_ERROR_EVENT, onError)
-      window.clearTimeout(timer)
+      window.clearTimeout(errorTimer)
+      window.clearInterval(clock)
     }
   }, [])
 
   const toggleTask = (id: string) => {
-    const task = tasks.find((item) => item.id === id)
-    if (task) updateTaskDoc(id, { completed: !task.completed })
+    const task = taskList.find((item) => item.id === id)
+    if (!task) return
+    const completed = !task.completed
+    const patch: Partial<Omit<Task, 'id' | 'createdAt'>> = { completed, completedAt: completed ? Date.now() : 0 }
+    // A finished task shouldn’t keep ringing on your phone.
+    if (completed && task.googleId && googleConnected()) {
+      deleteGoogleEvent(task.googleId).catch(() => undefined)
+      patch.googleId = ''
+    }
+    void tasks.update(id, patch)
   }
-  const addTask = (title: string) => addTaskDoc({ title, course: 'Personal', time: '', points: 20, color: tones[tasks.length % tones.length], completed: false })
-  const updateTask = (id: string, title: string) => updateTaskDoc(id, { title })
+
   const pageTitle = useMemo(() => navItems.find((item) => item.id === page)?.label ?? 'Home', [page])
 
   const navigate = (nextPage: Page) => {
@@ -1693,6 +2206,16 @@ function Workspace({ user }: { user: User }) {
     setSidebarOpen(false)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
+  const startNew = (target: Page) => {
+    navigate(target)
+    setLaunch(target)
+    setAddOpen(false)
+  }
+  const clearLaunch = () => setLaunch(null)
+
+  const notices = buildNotices(dueItems(reminders.items, medicines.items, taskList), now)
+  const unseen = notices.filter((notice) => !seen.includes(notice.key))
+  const markAllRead = () => setSeen(addSeen(notices.map((notice) => notice.key)))
 
   return (
     <div className="app-shell">
@@ -1702,16 +2225,16 @@ function Workspace({ user }: { user: User }) {
           <span className="nav-label">YOUR SPACE</span>
           {navItems.map((item) => (
             <Button className={page === item.id ? 'active' : ''} key={item.id} onClick={() => navigate(item.id)}>
-              <Icon name={item.icon} size={19} /><span>{item.label}</span>{item.id === 'tasks' && <em>{tasks.filter((task) => !task.completed).length}</em>}
+              <Icon name={item.icon} size={19} /><span>{item.label}</span>{item.id === 'tasks' && <em>{taskList.filter((task) => !task.completed).length}</em>}
             </Button>
           ))}
         </nav>
         <article className="sidebar-goal">
           <span><Icon name="spark" size={17} /></span>
           <small>WEEKLY GOAL</small>
-          <strong>{completedTasks.length} of {tasks.length} tasks</strong>
-          <ProgressBar value={pct(completedTasks.length, tasks.length)} />
-          <p>{plural(tasks.length - completedTasks.length, 'task')} to your goal</p>
+          <strong>{completedTasks.length} of {taskList.length} tasks</strong>
+          <ProgressBar value={pct(completedTasks.length, taskList.length)} />
+          <p>{plural(taskList.length - completedTasks.length, 'task')} to your goal</p>
         </article>
         <div className="sidebar-user">
           <img src={user.photoURL || '/uflow-profile.jpg'} alt={`${displayName} profile`} referrerPolicy="no-referrer" />
@@ -1725,24 +2248,46 @@ function Workspace({ user }: { user: User }) {
         <header className="topbar">
           <Button className="menu-button icon-button" onClick={() => setSidebarOpen(true)} ariaLabel="Open menu"><Icon name="menu" /></Button>
           <span className="mobile-title">{pageTitle}</span>
-          <label className="global-search"><Icon name="search" size={17} /><input placeholder="Search tasks, notes, events..." /><kbd>⌘ K</kbd></label>
+          <GlobalSearch data={{ tasks: taskList, notes: notes.items, reminders: reminders.items, medicines: medicines.items, events: events.items }} go={navigate} />
           <span className={`sync-status ${syncError ? 'error' : ''}`}><i /> {syncError ? 'Couldn’t save' : 'All synced'}</span>
-          <Button className="notification-button icon-button" onClick={() => setNotificationsOpen(!notificationsOpen)} ariaLabel="Open notifications"><Icon name="bell" size={19} /><i /></Button>
-          <Button className="top-add-button" onClick={() => navigate('tasks')}><Icon name="plus" size={17} /> Add new</Button>
+          <Button className="notification-button icon-button" onClick={() => setNotificationsOpen(!notificationsOpen)} ariaLabel="Open notifications"><Icon name="bell" size={19} />{unseen.length > 0 && <i />}</Button>
+          <div className="add-wrap">
+            <Button className="top-add-button" onClick={() => setAddOpen(!addOpen)}><Icon name="plus" size={17} /> Add new</Button>
+            {addOpen && (
+              <>
+                <Button className="menu-scrim" ariaLabel="Close add menu" onClick={() => setAddOpen(false)} />
+                <div className="add-menu">
+                  <Button onClick={() => startNew('tasks')}><Icon name="task" size={16} /> New task</Button>
+                  <Button onClick={() => startNew('reminders')}><Icon name="bell" size={16} /> Set reminder</Button>
+                  <Button onClick={() => startNew('medicine')}><Icon name="pill" size={16} /> Add medicine</Button>
+                  <Button onClick={() => startNew('calendar')}><Icon name="calendar" size={16} /> Add event</Button>
+                  <Button onClick={() => startNew('notes')}><Icon name="note" size={16} /> New note</Button>
+                </div>
+              </>
+            )}
+          </div>
         </header>
 
         <main className="content">
-          {page === 'dashboard' && <Dashboard tasks={tasks} toggleTask={toggleTask} navigate={navigate} name={name} />}
-          {page === 'tasks' && <TasksPage tasks={tasks} toggleTask={toggleTask} addTask={addTask} updateTask={updateTask} deleteTask={deleteTask} />}
-          {page === 'calendar' && <CalendarPage uid={user.uid} email={user.email} />}
-          {page === 'reminders' && <RemindersPage api={reminderApi} email={user.email} />}
-          {page === 'notes' && <NotesPage uid={user.uid} />}
-          {page === 'focus' && <FocusPage name={name} />}
-          {page === 'medicine' && <MedicinePage uid={user.uid} />}
+          {page === 'dashboard' && <Dashboard data={{ tasks: taskList, reminders: reminders.items, medicines: medicines.items, events: events.items, focus: focus.items }} toggleTask={toggleTask} navigate={navigate} name={name} />}
+          {page === 'tasks' && <TasksPage coll={tasks} toggleTask={toggleTask} email={user.email} launch={launch === 'tasks'} clearLaunch={clearLaunch} />}
+          {page === 'calendar' && <CalendarPage uid={user.uid} email={user.email} launch={launch === 'calendar'} clearLaunch={clearLaunch} />}
+          {page === 'reminders' && <RemindersPage coll={reminders} email={user.email} launch={launch === 'reminders'} clearLaunch={clearLaunch} />}
+          {page === 'notes' && <NotesPage uid={user.uid} launch={launch === 'notes'} clearLaunch={clearLaunch} />}
+          {page === 'focus' && <FocusPage name={name} timer={timer} sessions={focus.items} />}
+          {page === 'medicine' && <MedicinePage coll={medicines} email={user.email} launch={launch === 'medicine'} clearLaunch={clearLaunch} />}
         </main>
       </div>
 
-      <ReminderAlerts api={reminderApi} />
+      <AlertCenter data={{ reminders, medicines, tasks, toggleTask }} />
+
+      {timer.doneMinutes !== null && (
+        <div className="completion-toast">
+          <span><Icon name="spark" /></span>
+          <div><strong>Focus session complete!</strong><p>Great work, {name}. {fmtMinutes(timer.doneMinutes)} added to today’s focus. Take a short break.</p></div>
+          <Button className="icon-button" onClick={timer.dismiss} ariaLabel="Dismiss completion message"><Icon name="plus" /></Button>
+        </div>
+      )}
 
       <nav className="mobile-nav">
         {navItems.slice(0, 5).map((item) => (
@@ -1756,11 +2301,18 @@ function Workspace({ user }: { user: User }) {
         <>
           <Button className="drawer-scrim" onClick={() => setNotificationsOpen(false)} ariaLabel="Close notifications" />
           <aside className="notification-drawer">
-            <div className="drawer-heading"><div><span>NOTIFICATIONS</span><strong>You’re all caught up</strong></div><Button className="icon-button" onClick={() => setNotificationsOpen(false)} ariaLabel="Close notifications"><Icon name="plus" /></Button></div>
-            <div className="notification-item new"><span className="coral"><Icon name="task" /></span><div><strong>Task due soon</strong><p>Project presentation is due at 4:00 PM.</p><small>10 minutes ago</small></div></div>
-            <div className="notification-item"><span className="blue"><Icon name="calendar" /></span><div><strong>Class reminder</strong><p>Software Engineering starts in 30 minutes.</p><small>25 minutes ago</small></div></div>
-            <div className="notification-item"><span className="yellow"><Icon name="pill" /></span><div><strong>Medicine reminder</strong><p>Vitamin D is scheduled for 8:00 PM.</p><small>1 hour ago</small></div></div>
-            <Button className="outline-button full-button">Mark all as read</Button>
+            <div className="drawer-heading"><div><span>NOTIFICATIONS</span><strong>{notices.length === 0 ? 'You’re all caught up' : unseen.length > 0 ? `${unseen.length} new` : 'Nothing new'}</strong></div><Button className="icon-button" onClick={() => setNotificationsOpen(false)} ariaLabel="Close notifications"><Icon name="plus" /></Button></div>
+            {notices.map((notice) => {
+              const look = noticePage[notice.kind]
+              return (
+                <div className={`notification-item clickable ${seen.includes(notice.key) ? '' : 'new'}`} key={notice.key} role="button" tabIndex={0} onClick={() => { navigate(look.page); setNotificationsOpen(false) }} onKeyDown={(event) => { if (event.key === 'Enter') { navigate(look.page); setNotificationsOpen(false) } }}>
+                  <span className={look.tone}><Icon name={look.icon} /></span>
+                  <div><strong>{notice.title}</strong><p>{notice.text}</p><small>{formatWhen(notice.at)}</small></div>
+                </div>
+              )
+            })}
+            {notices.length === 0 && <div className="empty-state"><Icon name="bell" size={28} /><strong>Nothing to show</strong><span>Missed and upcoming reminders, doses and tasks appear here.</span></div>}
+            <Button className="outline-button full-button" onClick={markAllRead} disabled={unseen.length === 0}>Mark all as read</Button>
           </aside>
         </>
       )}

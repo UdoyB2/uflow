@@ -196,32 +196,37 @@ export async function deleteGoogleEvent(id: string): Promise<void> {
   await request(`${API}/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
+type AlertOptions = { daily?: boolean; note?: string; icon?: string }
+
 /**
  * Creates a short Google Calendar event whose pop-up alert fires at its start time.
  * The phone’s Google Calendar app then rings even when UFlow is closed.
+ * With daily: true the event repeats every day (used for medicine).
  */
-export async function createGoogleReminder(title: string, at: number): Promise<string> {
+export async function createGoogleReminder(title: string, at: number, options: AlertOptions = {}): Promise<string> {
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
   const body = {
-    summary: `🔔 ${title}`,
-    description: 'Reminder from UFlow',
+    summary: `${options.icon ?? '🔔'} ${title}`,
+    description: options.note || 'Alert from UFlow',
     start: { dateTime: new Date(at).toISOString(), timeZone },
     end: { dateTime: new Date(at + 15 * 60000).toISOString(), timeZone },
+    recurrence: options.daily ? ['RRULE:FREQ=DAILY'] : undefined,
     reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] },
   }
   const data = (await request(API, { method: 'POST', body: JSON.stringify(body) })) as { id: string } | null
-  if (!data) throw new Error('Google Calendar didn’t accept the reminder.')
+  if (!data) throw new Error('Google Calendar didn’t accept the alert.')
   return data.id
 }
 
-/** Moves a reminder event (used by Snooze). */
-export async function moveGoogleReminder(id: string, at: number): Promise<void> {
+/** Changes the title, time or note of an alert event made by createGoogleReminder. */
+export async function updateGoogleReminder(id: string, change: { title?: string; icon?: string; at?: number; note?: string }): Promise<void> {
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
-  await request(`${API}/${encodeURIComponent(id)}`, {
-    method: 'PATCH',
-    body: JSON.stringify({
-      start: { dateTime: new Date(at).toISOString(), timeZone },
-      end: { dateTime: new Date(at + 15 * 60000).toISOString(), timeZone },
-    }),
-  })
+  const body: Record<string, unknown> = {}
+  if (change.title !== undefined) body.summary = `${change.icon ?? '🔔'} ${change.title}`
+  if (change.note !== undefined) body.description = change.note
+  if (change.at !== undefined) {
+    body.start = { dateTime: new Date(change.at).toISOString(), timeZone }
+    body.end = { dateTime: new Date(change.at + 15 * 60000).toISOString(), timeZone }
+  }
+  await request(`${API}/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) })
 }

@@ -629,3 +629,47 @@
 .tone-select { background: var(--canvas); border: 1px solid var(--line); border-radius: .55rem; color: var(--ink); font-size: .65rem; height: 2.45rem; outline: none; padding: 0 .6rem; width: 100%; }
 .tone-actions { align-items: center; display: flex; flex-wrap: wrap; gap: .6rem; }
 .tone-error { color: oklch(.45 .15 30); font-weight: 600; }
+
+/* ---------- real data, search, add menu, due dates ---------- */
+.tick-row { align-items: flex-start; display: flex; flex: 1; gap: .55rem; min-width: 14rem; }
+.tick-row input { accent-color: var(--coral); flex: none; height: 1rem; margin: .1rem 0 0; padding: 0; width: 1rem; }
+.tick-row span { color: var(--ink); font-size: .65rem; font-weight: 600; letter-spacing: 0; margin: 0; }
+.tick-row small { color: var(--muted); display: block; font-size: .55rem; font-weight: 400; margin-top: .15rem; }
+.medicine-composer .reminder-google-row { grid-column: 1 / -1; }
+.composer-extra { margin-top: .6rem; }
+.composer-extra .reminder-google-row { background: var(--paper); border: 1px solid var(--line); border-radius: 1rem; padding: .8rem 1rem; }
+.task-composer .due-field { flex: 0 0 8.5rem; }
+.due-late { color: var(--coral) !important; font-weight: 700; }
+.alert-toast p { color: var(--muted); font-size: .6rem; margin: .2rem 0 0; }
+.alert-toast-actions .text-button { color: var(--muted); font-size: .62rem; padding: .5rem .4rem; }
+.timeline.wide > div { grid-template-columns: 3.2rem .55rem 1fr; }
+.timeline.wide > div:not(:last-child)::after { left: 3.45rem; }
+.timeline time { white-space: nowrap; }
+.timeline i.coral { background: var(--coral); }
+.timeline i.blue { background: var(--blue); }
+.timeline i.yellow { background: var(--yellow); }
+.timeline i.green { background: var(--green); }
+.timeline-more { color: var(--muted); font-size: .55rem; margin: .4rem 0 0 3.8rem; }
+.timeline .empty-state { grid-column: 1 / -1; }
+.bar-chart i:nth-child(5):not(.today) { background: var(--blue); }
+.bar-chart i.today { background: var(--coral); }
+.routine-days .missed > span { background: var(--coral-soft); }
+.medicine-manage { align-items: center; display: flex; gap: .5rem; }
+.global-search-wrap { position: relative; }
+.search-results { background: var(--paper); border: 1px solid var(--line); border-radius: .9rem; box-shadow: 0 1rem 3rem oklch(0.3 0.035 55 / .18); left: 0; max-height: 22rem; overflow-y: auto; padding: .4rem; position: absolute; top: calc(100% + .4rem); width: min(26rem, 90vw); z-index: 60; }
+.search-result { align-items: center; background: none; border: 0; border-radius: .6rem; color: var(--ink); cursor: pointer; display: flex; gap: .7rem; padding: .55rem .6rem; text-align: left; width: 100%; }
+.search-result:hover { background: var(--canvas); }
+.search-result em { background: var(--coral-soft); border-radius: .4rem; color: var(--coral); flex: none; font-size: .5rem; font-style: normal; font-weight: 800; letter-spacing: .06em; min-width: 4.2rem; padding: .3rem .4rem; text-align: center; text-transform: uppercase; }
+.search-result b, .search-result small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-result b { font-size: .68rem; }
+.search-result small { color: var(--muted); font-size: .55rem; margin-top: .1rem; }
+.search-empty { color: var(--muted); font-size: .62rem; margin: 0; padding: .8rem; }
+.add-wrap { position: relative; }
+.menu-scrim { background: transparent; border: 0; cursor: default; inset: 0; position: fixed; z-index: 40; }
+.add-menu { background: var(--paper); border: 1px solid var(--line); border-radius: .9rem; box-shadow: 0 1rem 3rem oklch(0.3 0.035 55 / .18); display: flex; flex-direction: column; min-width: 12rem; padding: .4rem; position: absolute; right: 0; top: calc(100% + .45rem); z-index: 41; }
+.add-menu .button { border-radius: .6rem; color: var(--ink); font-size: .68rem; font-weight: 600; gap: .65rem; justify-content: flex-start; padding: .65rem .7rem; width: 100%; }
+.add-menu .button:hover { background: var(--canvas); }
+.notification-item.clickable { cursor: pointer; }
+.notification-item.clickable:hover { background: var(--canvas); }
+.notification-drawer .empty-state { margin: 2rem 0; }
+.notification-drawer .full-button { margin-top: 1rem; }

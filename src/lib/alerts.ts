@@ -55,6 +55,42 @@ export const markFired = (key: string) => {
   }
 }
 
+/* ---------- snoozes (medicine and tasks) and read notifications ---------- */
+
+const SNOOZE_KEY = 'uflow-snoozes'
+const SEEN_KEY = 'uflow-notices-seen'
+
+const readJson = <T,>(key: string, fallback: T): T => {
+  try {
+    return JSON.parse(localStorage.getItem(key) || '') as T
+  } catch {
+    return fallback
+  }
+}
+const writeJson = (key: string, value: unknown) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* storage can be blocked; this only lasts until the page is closed */
+  }
+}
+
+export const getSnooze = (key: string): number | undefined => readJson<Record<string, number>>(SNOOZE_KEY, {})[key]
+export const setSnooze = (key: string, until: number) => {
+  const all = readJson<Record<string, number>>(SNOOZE_KEY, {})
+  const cutoff = Date.now() - 86400000
+  for (const k of Object.keys(all)) if (all[k] < cutoff) delete all[k]
+  all[key] = until
+  writeJson(SNOOZE_KEY, all)
+}
+
+export const getSeen = () => readJson<string[]>(SEEN_KEY, [])
+export const addSeen = (keys: string[]) => {
+  const next = Array.from(new Set([...getSeen(), ...keys])).slice(-300)
+  writeJson(SEEN_KEY, next)
+  return next
+}
+
 /* ---------- ringtone (built-in tones are generated; students can also upload their own) ---------- */
 
 type Note = { f: number; at: number; len: number; type?: OscillatorType; vol?: number }
